@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -30,9 +31,7 @@ PAYOUT_LOG_CHANNEL = os.getenv("PAYOUT_LOG_CHANNEL", "")  # যেমন: "-1001
 DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
 
 DEFAULT_DATA: Dict[str, Any] = {
-    "users": {
-        # উদাহরণ ইউজার ব্যালেন্স; রিয়েল বটে ইউজার রেজিস্ট্রেশনে ব্যালেন্স সেট করবেন
-    },
+    "users": {},
     "withdraws": {},
     "next_wid": 1001,
     "settings": {
@@ -656,7 +655,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             try:
                 amount = round(float(text), 2)
             except ValueError:
-                await update.message.reply_text("❌ বৈধ সংখ্যায় অ্যামাউন্ট লিখুন (যেমন: <code>500</code>)।", parse_mode="HTML")
+                await update.message.reply_text(
+                    "❌ বৈধ সংখ্যায় অ্যামাউন্ট লিখুন (যেমন: <code>500</code>)।",
+                    parse_mode="HTML",
+                )
                 return
 
             if amount < cfg["min"] or amount > cfg["max"]:
@@ -730,7 +732,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     wid = adm_act["wid"]
-    idx = adm_act["idx"]
     wd = DB["withdraws"].get(wid)
     context.user_data.pop("admin_action", None)
 
@@ -785,6 +786,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def main() -> None:
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("BOT_TOKEN environment variable সেট করুন।")
+
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
