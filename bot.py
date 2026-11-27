@@ -55,6 +55,7 @@ DEFAULT_DATA = {
         "max_withdraw_bkash": 5000.0,
         "min_withdraw_nagad": 50.0,
         "max_withdraw_nagad": 5000.0,
+        "wd_charge": 5.0,  # প্রতি উইথড্রে ফিক্সড চার্জ (টাকা) — অ্যাডমিন প্যানেল থেকে বদলানো যায়
         # ---- পেআউট লগ (OFF থাকলে শুধু অ্যাডমিনকে নোটিফিকেশন যায়) ----
         "payout_log_active": "OFF",
         "payout_log_chat": "",
@@ -124,6 +125,25 @@ def wd_active_methods(data: dict) -> list:
 
 def withdraw_allowed(data: dict) -> bool:
     return len(wd_active_methods(data)) > 0
+
+def wd_charge_amount(data: dict) -> float:
+    """অ্যাডমিনের সেট করা উইথড্র চার্জ (ফিক্সড টাকা, ডিফল্ট ০)।"""
+    try:
+        return max(0.0, float(data["settings"].get("wd_charge", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+def wd_net_amount(data: dict, amount: float) -> float:
+    """চার্জ কেটে নিট পেমেন্টের পরিমাণ (০-এর নিচে যাবে না)।"""
+    return max(0.0, float(amount) - wd_charge_amount(data))
+
+def wd_amount_lines(data: dict, amount: float) -> str:
+    """চার্জ > ০ হলে 'পরিমাণ | চার্জ | পাবেন' লাইন, না হলে শুধু পরিমাণের লাইন।"""
+    charge = wd_charge_amount(data)
+    if charge > 0:
+        net = wd_net_amount(data, amount)
+        return f"💰 পরিমাণ: <b>{amount:g} ৳</b> | চার্জ: <b>{charge:g} ৳</b> | পাবেন: <b>{net:g} ৳</b>"
+    return f"💰 পরিমাণ: <b>{amount:g} ৳</b>"
 
 def wd_validate_amount(data: dict, method: str, amount: float, balance: float):
     """পরিমাণ যাচাই করে। (ঠিক আছে?, ভুল বার্তা) দেয়।"""
@@ -498,11 +518,13 @@ async def show_wd_settings_page(context, chat_id, message_id, data):
     s = data["settings"]
     mn_b, mx_b = wd_method_limits(data, "bKash")
     mn_n, mx_n = wd_method_limits(data, "Nagad")
+    charge = wd_charge_amount(data)
     text = (
         "💸 <b>উইথড্র সেটিংস</b>\n\n"
         f"🔘 উইথড্র: <b>{s.get('withdraw_enabled', 'ON')}</b>\n"
         f"🩷 bKash: <b>{s.get('wd_bkash_active', 'ON')}</b> | লিমিট: <b>{mn_b:g}–{mx_b:g} ৳</b>\n"
-        f"🧡 Nagad: <b>{s.get('wd_nagad_active', 'ON')}</b> | লিমিট: <b>{mn_n:g}–{mx_n:g} ৳</b>\n\n"
+        f"🧡 Nagad: <b>{s.get('wd_nagad_active', 'ON')}</b> | লিমিট: <b>{mn_n:g}–{mx_n:g} ৳</b>\n"
+        f"💸 চার্জ: <b>{charge:g} ৳</b> (প্রতি উইথড্রে)\n\n"
         "যেকোনো বাটনে চাপ দিয়ে ON/OFF করুন বা লিমিট বদলান:"
     )
     rows = [
@@ -515,6 +537,7 @@ async def show_wd_settings_page(context, chat_id, message_id, data):
             btn("✏️ bKash লিমিট", callback_data="adm_wd_edit_bkash", color="blue"),
             btn("✏️ Nagad লিমিট", callback_data="adm_wd_edit_nagad", color="blue"),
         ],
+        [btn(f"✏️ চার্জ সেট করুন ({charge:g} ৳)", callback_data="adm_wd_edit_charge", color="blue")],
         [btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")],
     ]
     await edit_styled_inline(context, chat_id, message_id, text, rows)
@@ -588,6 +611,22 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔻 সর্বনিম্ন: <b>{mn:g} ৳</b> | 🔺 সর্বোচ্চ: <b>{mx:g} ৳</b>\n\n"
             f"এখন আপনার <b>{method} পার্সোনাল নম্বরটি</b> লিখে পাঠান:\n"
             f"<i>(১১ ডিজিটের নম্বর দিন, বাতিল করতে /cancel লিখুন)</i>",
+            rows=[[btn("✖️ বাতিল", callback_data="wd_cancel", color="red")]],
+        )
+        return
+
+    # Withdraw Cancel (one-tap cancel from any withdraw step)
+    if cb_data == "wd_cancel":
+        context.user_data.clear()
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await send_reply_menu(
+            update,
+            context,
+            "✅ উইথড্র বাতিল করা হয়েছে।",
+            main_menu_reply_rows(user_id),
         )
         return
 
@@ -619,10 +658,9 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=int(wd["user_id"]),
                     text=(
                         f"✅ <b>আপনার উইথড্র সফলভাবে পেমেন্ট করা হয়েছে!</b>\n\n"
-                        f"🆔 ট্রানজেকশন আইডি: <code>#{wd_id}</code>\n"
                         f"💳 মেথড: <b>{wd['method']}</b>\n"
                         f"📱 নম্বর: <code>{wd['number']}</code>\n"
-                        f"💰 পরিমাণ: <b>{wd['amount']} ৳</b>"
+                        f"{wd_amount_lines(data, float(wd['amount']))}"
                     ),
                     parse_mode=ParseMode.HTML,
                 )
@@ -752,6 +790,22 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if cb_data == "adm_wd_edit_charge":
+            charge = wd_charge_amount(data)
+            context.user_data["state"] = "WAIT_ADM_WD_CHARGE"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✏️ <b>উইথড্র চার্জ সেট করুন:</b>\n\n"
+                    f"বর্তমান চার্জ: <code>{charge:g} ৳</code> (প্রতি উইথড্রে)\n\n"
+                    "চার্জের পরিমাণ লিখুন (যেমন: <code>10</code> বা <code>0</code>)।\n"
+                    "চার্জ ০ থাকলে কোনো টাকা কাটা হবে না।"
+                    "\n\n<i>বাতিল করতে /cancel লিখুন</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         if cb_data == "adm_payout_log":
             await show_payout_log_page(context, chat_id, message_id, data)
             return
@@ -853,6 +907,14 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_data(data)
                 await update.message.reply_text(f"✅ Nagad লিমিট সেট হয়েছে: <b>{mn:g}–{mx:g} ৳</b>", parse_mode=ParseMode.HTML)
 
+            elif state == "WAIT_ADM_WD_CHARGE":
+                val = float(text)
+                if val < 0:
+                    raise ValueError("চার্জ ০ বা তার বেশি হতে হবে।")
+                data["settings"]["wd_charge"] = val
+                save_data(data)
+                await update.message.reply_text(f"✅ উইথড্র চার্জ সেট হয়েছে: <b>{val:g} ৳</b>", parse_mode=ParseMode.HTML)
+
             elif state == "WAIT_ADM_LOGCHAT":
                 data["settings"]["payout_log_chat"] = "" if text.lower() == "off" else text
                 save_data(data)
@@ -940,11 +1002,13 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["wd_number"] = text
         context.user_data["state"] = "WAIT_WD_AMOUNT"
         mn, mx = wd_method_limits(data, method)
-        await update.message.reply_text(
+        await send_styled_inline(
+            context,
+            update.effective_chat.id,
             f"💰 আপনার বর্তমান ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
             f"🔻 সর্বনিম্ন: <b>{mn:g} ৳</b> | 🔺 সর্বোচ্চ: <b>{mx:g} ৳</b>\n\n"
             f"কত টাকা উইথড্র করতে চান তা লিখুন:",
-            parse_mode=ParseMode.HTML,
+            rows=[[btn("✖️ বাতিল", callback_data="wd_cancel", color="red")]],
         )
         return
 
@@ -988,12 +1052,12 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_styled_inline(
                 context,
                 ADMIN_ID,
-                f"🔔 <b>NEW WITHDRAW REQUEST (#{wd_id})</b>\n\n"
+                f"🔔 <b>NEW WITHDRAW REQUEST</b>\n\n"
                 f"👤 ইউজার: <b>{user_obj.first_name}</b> (<code>{uid}</code>)\n"
                 f"👥 মোট রেফার: <b>{user['refers']}</b>\n"
                 f"💳 মেথড: <b>{method}</b>\n"
                 f"📱 নম্বর: <code>{number}</code>\n"
-                f"💰 পরিমাণ: <b>{amount} ৳</b>",
+                f"{wd_amount_lines(data, amount)}",
                 rows=admin_rows,
             )
         except Exception as e:
@@ -1053,12 +1117,14 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        charge = wd_charge_amount(data)
         rows = []
         for m in active:
             mn, mx = wd_method_limits(data, m)
             color = "red" if m == "bKash" else "green"
-            emoji = "🩷" if m == "bKash" else "🧡"
-            rows.append([btn(f"{emoji} {m} ({mn:g}–{mx:g} ৳)", callback_data=f"wd_method_{m}", color=color)])
+            display = "Bkash" if m == "bKash" else "Nagad"
+            rows.append([btn(f"💳 {display} -> Min: {mn:g}৳ (-{charge:g}৳)", callback_data=f"wd_method_{m}", color=color)])
+        rows.append([btn("✖️ বাতিল", callback_data="wd_cancel", color="red")])
         await send_styled_inline(context, update.effective_chat.id, "💳 <b>পেমেন্ট মেথড সিলেক্ট করুন:</b>", rows)
 
     elif text == "📞 Support":
