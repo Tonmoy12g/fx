@@ -1,809 +1,1096 @@
-import asyncio
-import json
-import logging
 import os
-from datetime import datetime
-from typing import Any, Dict
-
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import json
+import asyncio
+import logging
+from threading import Thread
+from flask import Flask
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
+    Application,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
+from telegram.constants import ParseMode
+
+# ================= CONFIGURATION =================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "123456789"))
+DB_FILE = "bot_data.json"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==================== কনফিগারেশন (Environment Variables) ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_IDS = [
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "123456789").split(",")
-    if x.strip().isdigit()
-]
-PAYOUT_LOG_CHANNEL = os.getenv("PAYOUT_LOG_CHANNEL", "")  # যেমন: "-1001234567890"
-DATA_FILE = os.getenv("DATA_FILE", "bot_data.json")
+# ================= KEEP ALIVE SERVER =================
+web_app = Flask(__name__)
 
-DEFAULT_DATA: Dict[str, Any] = {
+@web_app.route("/")
+def home():
+    return "Referral Bot is Running 24/7!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
+
+# ================= DATABASE HELPER =================
+DEFAULT_DATA = {
     "users": {},
-    "withdraws": {},
-    "next_wid": 1001,
     "settings": {
-        "bkash": {
-            "enabled": True,
-            "min": 100.0,
-            "max": 25000.0,
-            "fee_type": "fixed",  # "fixed" অথবা "percent"
-            "fee": 10.0,
-        },
-        "nagad": {
-            "enabled": True,
-            "min": 100.0,
-            "max": 25000.0,
-            "fee_type": "fixed",  # "fixed" অথবা "percent"
-            "fee": 10.0,
-        },
+        "refer_bonus": 2.0,
+        # ---- উইথড্র সিস্টেম (bKash / Nagad শুধু) ----
+        "withdraw_enabled": "ON",  # "ON" অথবা "OFF" — OFF থাকলে নতুন উইথড্র বন্ধ
+        "wd_bkash_active": "ON",
+        "wd_nagad_active": "ON",
+        "min_withdraw_bkash": 50.0,
+        "max_withdraw_bkash": 5000.0,
+        "min_withdraw_nagad": 50.0,
+        "max_withdraw_nagad": 5000.0,
+        # ---- পেআউট লগ (OFF থাকলে শুধু অ্যাডমিনকে নোটিফিকেশন যায়) ----
+        "payout_log_active": "OFF",
+        "payout_log_chat": "",
+        "force_channel": "",
+        "support_id": "@AdminUsername",
     },
+    "withdraws": {},
+    "withdraw_counter": 1000,
 }
 
+def load_data():
+    if not os.path.exists(DB_FILE):
+        save_data(DEFAULT_DATA)
+        return json.loads(json.dumps(DEFAULT_DATA))
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    # পুরনো DB-তে নতুন উইথড্র সেটিংস না থাকলে ডিফল্ট বসিয়ে নাও
+    defaults = DEFAULT_DATA["settings"]
+    for key, val in defaults.items():
+        data.setdefault("settings", {}).setdefault(key, val)
+    data.setdefault("withdraws", {})
+    data.setdefault("withdraw_counter", 1000)
+    return data
 
-def load_data() -> Dict[str, Any]:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            for k, v in DEFAULT_DATA.items():
-                if k not in loaded:
-                    loaded[k] = v
-            for m in ("bkash", "nagad"):
-                if m not in loaded["settings"]:
-                    loaded["settings"][m] = DEFAULT_DATA["settings"][m].copy()
-            return loaded
-        except Exception as e:
-            logger.error(f"Error loading data: {e}")
-    return json.loads(json.dumps(DEFAULT_DATA))
+def save_data(data):
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-
-def save_data(data: Dict[str, Any]) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-DB = load_data()
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def ensure_user(user_id: int, username: str = "", full_name: str = "") -> Dict[str, Any]:
+def get_user(data, user_id, name="User"):
     uid = str(user_id)
-    if uid not in DB["users"]:
-        DB["users"][uid] = {
-            "balance": 500.0,  # নতুন ইউজারের ডিফল্ট ব্যালেন্স (প্রয়োজনে 0.0 করুন)
-            "username": username or "",
-            "name": full_name or "",
+    if uid not in data["users"]:
+        data["users"][uid] = {
+            "name": name,
+            "balance": 0.0,
+            "earned": 0.0,  # আজীবন রেফারেল আয় (ওয়ালেটে দেখানোর জন্য)
+            "refers": 0,
+            "referred_by": None,
+            "refer_paid": False,
+            "banned": False,
         }
-        save_data(DB)
     else:
-        if username:
-            DB["users"][uid]["username"] = username
-        if full_name:
-            DB["users"][uid]["name"] = full_name
-    return DB["users"][uid]
+        data["users"][uid].setdefault("earned", 0.0)
+    return data["users"][uid]
 
+# ================= WITHDRAW HELPERS (bKash / Nagad শুধু) =================
+WD_METHODS = ["bKash", "Nagad"]
 
-def calc_fee(method: str, amount: float) -> float:
-    cfg = DB["settings"][method]
-    fee_val = float(cfg.get("fee", 0.0))
-    if cfg.get("fee_type") == "percent":
-        return round((amount * fee_val) / 100.0, 2)
-    return round(fee_val, 2)
+def wd_method_limits(data: dict, method: str):
+    """প্রতি মেথডের (সর্বনিম্ন, সর্বোচ্চ) লিমিট দেয়।"""
+    key = method.lower()
+    s = data["settings"]
+    mn = float(s.get(f"min_withdraw_{key}", 50.0))
+    mx = float(s.get(f"max_withdraw_{key}", 5000.0))
+    return mn, mx
 
+def wd_active_methods(data: dict) -> list:
+    """চালু থাকা উইথড্র মেথডগুলো দেয়। গ্লোবাল OFF থাকলে খালি লিস্ট।"""
+    s = data["settings"]
+    if str(s.get("withdraw_enabled", "ON")).upper() != "ON":
+        return []
+    active = []
+    if str(s.get("wd_bkash_active", "ON")).upper() == "ON":
+        active.append("bKash")
+    if str(s.get("wd_nagad_active", "ON")).upper() == "ON":
+        active.append("Nagad")
+    return active
 
-def method_label(method: str) -> str:
-    return "bKash" if method == "bkash" else "Nagad"
+def withdraw_allowed(data: dict) -> bool:
+    return len(wd_active_methods(data)) > 0
 
+def wd_validate_amount(data: dict, method: str, amount: float, balance: float):
+    """পরিমাণ যাচাই করে। (ঠিক আছে?, ভুল বার্তা) দেয়।"""
+    mn, mx = wd_method_limits(data, method)
+    if amount < mn:
+        return False, f"❌ সর্বনিম্ন উইথড্র <b>{mn:g} ৳</b>! আবার পরিমাণ লিখুন:"
+    if amount > mx:
+        return False, f"❌ সর্বোচ্চ উইথড্র <b>{mx:g} ৳</b>! আবার পরিমাণ লিখুন:"
+    if amount > balance:
+        return False, "❌ আপনার অ্যাকাউন্টে পর্যাপ্ত ব্যালেন্স নেই! /cancel দিয়ে বাতিল করুন।"
+    return True, ""
 
-# ==================== কীবোর্ড বিল্ডার ====================
-def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("💸 Withdraw", callback_data="wd_menu")],
-        [InlineKeyboardButton("📜 My Withdraws", callback_data="my_wd")],
-    ]
-    if is_admin(user_id):
-        rows.append([InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(rows)
-
-
-def withdraw_method_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for m in ("bkash", "nagad"):
-        cfg = DB["settings"][m]
-        status_txt = "" if cfg["enabled"] else " (OFF)"
-        rows.append(
-            [InlineKeyboardButton(f"{method_label(m)}{status_txt}", callback_data=f"wd_pick:{m}")]
-        )
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="main_menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-def admin_panel_kb() -> InlineKeyboardMarkup:
-    pending_count = sum(1 for w in DB["withdraws"].values() if w["status"] == "pending")
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"📥 Pending Withdraws ({pending_count})", callback_data="adm_pending:0"
-                )
-            ],
-            [InlineKeyboardButton("⚙️ System Settings", callback_data="adm_settings")],
-            [InlineKeyboardButton("⬅️ Main Menu", callback_data="main_menu")],
-        ]
+def user_wallet_stats(data: dict, uid: str) -> dict:
+    """ওয়ালেটের হিসাব: ব্যালেন্স, পেন্ডিং উইথড্র, আজীবন আয়, উইথড্র গণনা।"""
+    user = data["users"].get(uid, {})
+    pending = sum(
+        float(w["amount"])
+        for w in data.get("withdraws", {}).values()
+        if w.get("user_id") == uid and w.get("status") == "pending"
     )
+    counts = {"approved": 0, "pending": 0, "rejected": 0}
+    for w in data.get("withdraws", {}).values():
+        if w.get("user_id") == uid and w.get("status") in counts:
+            counts[w["status"]] += 1
+    return {
+        "balance": float(user.get("balance", 0.0)),
+        "earned": float(user.get("earned", 0.0)),
+        "pending_withdraw": pending,
+        "approved": counts["approved"],
+        "pending_count": counts["pending"],
+        "rejected": counts["rejected"],
+    }
 
+def create_withdraw(data: dict, uid: str, user_name: str, method: str, number: str, amount: float) -> str:
+    """ব্যালেন্স কেটে পেন্ডিং উইথড্র রিকোয়েস্ট তৈরি করে, আইডি দেয়।"""
+    data["users"][uid]["balance"] = float(data["users"][uid]["balance"]) - amount
+    data["withdraw_counter"] += 1
+    wd_id = str(data["withdraw_counter"])
+    data["withdraws"][wd_id] = {
+        "user_id": uid,
+        "user_name": user_name,
+        "method": method,
+        "number": number,
+        "amount": amount,
+        "status": "pending",
+    }
+    save_data(data)
+    return wd_id
 
-def admin_settings_kb() -> InlineKeyboardMarkup:
-    bk = DB["settings"]["bkash"]
-    ng = DB["settings"]["nagad"]
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"bKash: {'ON ✅' if bk['enabled'] else 'OFF ❌'}",
-                    callback_data="adm_toggle:bkash",
-                ),
-                InlineKeyboardButton(
-                    f"Nagad: {'ON ✅' if ng['enabled'] else 'OFF ❌'}",
-                    callback_data="adm_toggle:nagad",
-                ),
-            ],
-            [
-                InlineKeyboardButton("✏️ Edit bKash", callback_data="adm_edit_menu:bkash"),
-                InlineKeyboardButton("✏️ Edit Nagad", callback_data="adm_edit_menu:nagad"),
-            ],
-            [InlineKeyboardButton("⬅️ Admin Panel", callback_data="admin_panel")],
-        ]
-    )
+def approve_withdraw(data: dict, wd_id: str):
+    """পেন্ডিং রিকোয়েস্ট approved করে। (ঠিক আছে?, ভুল বার্তা) দেয়।"""
+    wd = data.get("withdraws", {}).get(wd_id)
+    if not wd or wd.get("status") != "pending":
+        return False, "⚠️ এই রিকোয়েস্ট আগেই প্রসেস করা হয়েছে!"
+    wd["status"] = "approved"
+    save_data(data)
+    return True, ""
 
+def reject_withdraw(data: dict, wd_id: str):
+    """পেন্ডিং রিকোয়েস্ট rejected করে, টাকা ব্যালেন্সে ফেরত দেয়।"""
+    wd = data.get("withdraws", {}).get(wd_id)
+    if not wd or wd.get("status") != "pending":
+        return False, "⚠️ এই রিকোয়েস্ট আগেই প্রসেস করা হয়েছে!"
+    wd["status"] = "rejected"
+    target_uid = wd["user_id"]
+    if target_uid in data["users"]:
+        data["users"][target_uid]["balance"] = float(data["users"][target_uid]["balance"]) + float(wd["amount"])
+    save_data(data)
+    return True, ""
 
-def edit_method_kb(method: str) -> InlineKeyboardMarkup:
-    lbl = method_label(method)
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(f"Min/Max ({lbl})", callback_data=f"adm_set:{method}:limits"),
-                InlineKeyboardButton(f"Charge ({lbl})", callback_data=f"adm_set:{method}:fee"),
-            ],
-            [InlineKeyboardButton("⬅️ Settings", callback_data="adm_settings")],
-        ]
-    )
-
-
-def pending_action_kb(wid: str, idx: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"adm_app:{wid}:{idx}"),
-                InlineKeyboardButton("📸 Pay + Proof", callback_data=f"adm_proof:{wid}:{idx}"),
-            ],
-            [InlineKeyboardButton("❌ Reject (Refund)", callback_data=f"adm_rej:{wid}:{idx}")],
-            [
-                InlineKeyboardButton("⬅️ Prev", callback_data=f"adm_pending:{max(0, idx - 1)}"),
-                InlineKeyboardButton("Next ➡️", callback_data=f"adm_pending:{idx + 1}"),
-            ],
-            [InlineKeyboardButton("🏠 Admin Panel", callback_data="admin_panel")],
-        ]
-    )
-
-
-# ==================== ইউজার কমান্ড ও ফ্লো ====================
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    u_data = ensure_user(user.id, user.username or "", user.full_name or "")
-    context.user_data.clear()
-
+async def post_payout_log(context: ContextTypes.DEFAULT_TYPE, data: dict, event: str, wd: dict):
+    """পেআউট লগ: লগ চ্যাট সেট ও ON থাকলে সেখানে পাঠায় (pending / paid)।"""
+    s = data["settings"]
+    if str(s.get("payout_log_active", "OFF")).upper() != "ON":
+        return
+    chat = str(s.get("payout_log_chat", "")).strip()
+    if not chat:
+        return
+    title = "🆕 নতুন উইথড্র রিকোয়েস্ট" if event == "pending" else "✅ উইথড্র পেমেন্ট সম্পন্ন"
     text = (
-        f"👋 স্বাগতম, <b>{user.full_name}</b>!\n\n"
-        f"💰 বর্তমান ব্যালেন্স: <b>{u_data['balance']:.2f} BDT</b>\n"
-        f"নিচের মেনু থেকে Withdraw বা অপশন বেছে নিন।"
+        f"{title}\n\n"
+        f"🆔 আইডি: <code>#{wd.get('wd_id', '')}</code>\n"
+        f"👤 ইউজার: <b>{wd.get('user_name', '')}</b> (<code>{wd.get('user_id', '')}</code>)\n"
+        f"💳 মেথড: <b>{wd.get('method', '')}</b>\n"
+        f"📱 নম্বর: <code>{wd.get('number', '')}</code>\n"
+        f"💰 পরিমাণ: <b>{wd.get('amount', 0)} ৳</b>"
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu_kb(user.id))
-
-
-async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ এই কমান্ডটি শুধু অ্যাডমিনের জন্য।")
-        return
-    await update.message.reply_text(
-        "🛠️ <b>Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb()
-    )
-
-
-async def addbal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """অ্যাডমিন হেল্পার: /addbal <user_id> <amount>"""
-    if not is_admin(update.effective_user.id):
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("ব্যবহার: <code>/addbal 123456789 500</code>", parse_mode="HTML")
-        return
-    target_uid = context.args[0].strip()
     try:
-        amt = float(context.args[1])
-    except ValueError:
-        await update.message.reply_text("❌ সঠিক অ্যামাউন্ট দিন।")
-        return
-
-    if target_uid not in DB["users"]:
-        DB["users"][target_uid] = {"balance": 0.0, "username": "", "name": ""}
-    DB["users"][target_uid]["balance"] = round(DB["users"][target_uid]["balance"] + amt, 2)
-    save_data(DB)
-    await update.message.reply_text(
-        f"✅ ইউজার <code>{target_uid}</code>-এর নতুন ব্যালেন্স: <b>{DB['users'][target_uid]['balance']:.2f} BDT</b>",
-        parse_mode="HTML",
-    )
-
-
-async def show_withdraw_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    u_data = ensure_user(user.id, user.username or "", user.full_name or "")
-    context.user_data.pop("wd_flow", None)
-
-    lines = [
-        "💸 <b>Withdraw Method নির্বাচন করুন</b>",
-        f"💰 ব্যালেন্স: <b>{u_data['balance']:.2f} BDT</b>\n",
-    ]
-    for m in ("bkash", "nagad"):
-        cfg = DB["settings"][m]
-        st = "🟢 Active" if cfg["enabled"] else "🔴 Disabled"
-        fee_str = (
-            f"{cfg['fee']}%" if cfg.get("fee_type") == "percent" else f"{cfg['fee']:.2f} BDT"
-        )
-        lines.append(
-            f"• <b>{method_label(m)}</b> ({st}): Min <b>{cfg['min']:.2f}</b> | Max <b>{cfg['max']:.2f}</b> | Fee: <b>{fee_str}</b>"
-        )
-
-    await query.edit_message_text(
-        "\n".join(lines), parse_mode="HTML", reply_markup=withdraw_method_kb()
-    )
-
-
-async def pick_withdraw_method(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    method = query.data.split(":")[1]
-    cfg = DB["settings"][method]
-
-    if not cfg["enabled"]:
-        await query.edit_message_text(
-            f"❌ বর্তমানে <b>{method_label(method)}</b> উইথড্র বন্ধ আছে।",
-            parse_mode="HTML",
-            reply_markup=withdraw_method_kb(),
-        )
-        return
-
-    context.user_data["wd_flow"] = {"step": "account", "method": method}
-    await query.edit_message_text(
-        f"📱 <b>{method_label(method)} Withdraw</b>\n\n"
-        f"আপনার <b>{method_label(method)}</b> অ্যাকাউন্ট নম্বরটি লিখে পাঠান (যেমন: <code>017XXXXXXXX</code>):",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ Cancel", callback_data="wd_menu")]]
-        ),
-    )
-
-
-async def show_my_withdraws(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    uid_str = str(query.from_user.id)
-    user_wds = [w for w in DB["withdraws"].values() if w["user_id"] == uid_str]
-    user_wds.sort(key=lambda x: x["id"], reverse=True)
-
-    if not user_wds:
-        text = "📜 আপনার কোনো উইথড্র রিকোয়েস্ট নেই।"
-    else:
-        lines = ["📜 <b>আপনার সাম্প্রতিক উইথড্রসমূহ:</b>\n"]
-        badge = {"pending": "⏳ Pending", "approved": "✅ Approved", "rejected": "❌ Rejected"}
-        for w in user_wds[:10]:
-            lines.append(
-                f"#{w['id']} | <b>{method_label(w['method'])}</b> | "
-                f"<b>{w['amount']:.2f} BDT</b> | {badge.get(w['status'], w['status'])}"
-            )
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("⬅️ Main Menu", callback_data="main_menu")]]
-        ),
-    )
-
-
-async def send_payout_log(context: ContextTypes.DEFAULT_TYPE, wd: Dict[str, Any], extra_note: str = "") -> None:
-    if not PAYOUT_LOG_CHANNEL:
-        return
-    try:
-        status_map = {"pending": "⏳ PENDING", "approved": "✅ PAID", "rejected": "❌ REJECTED"}
-        msg = (
-            f"🧾 <b>Withdraw Log #{wd['id']}</b>\n"
-            f"Status: <b>{status_map.get(wd['status'], wd['status'])}</b>\n"
-            f"User: <code>{wd['user_id']}</code> ({wd.get('username') or wd.get('name') or 'N/A'})\n"
-            f"Method: <b>{method_label(wd['method'])}</b>\n"
-            f"Account: <code>{wd['account']}</code>\n"
-            f"Amount: <b>{wd['amount']:.2f} BDT</b>\n"
-            f"Fee: <b>{wd['fee']:.2f} BDT</b>\n"
-            f"Net Payable: <b>{wd['net_amount']:.2f} BDT</b>\n"
-            f"Time: <code>{wd['created_at']}</code>"
-        )
-        if extra_note:
-            msg += f"\nNote: {extra_note}"
-        await context.bot.send_message(chat_id=PAYOUT_LOG_CHANNEL, text=msg, parse_mode="HTML")
+        target = int(chat) if chat.lstrip("-").isdigit() else chat
+        await context.bot.send_message(chat_id=target, text=text, parse_mode=ParseMode.HTML)
     except Exception as e:
-        logger.error(f"Failed to post payout log: {e}")
+        logger.error(f"Payout log failed: {e}")
 
+# ================= COLORED BUTTON HELPERS =================
+STYLE_MAP = {
+    "green": "success",
+    "blue": "primary",
+    "red": "danger",
+}
 
-# ==================== অ্যাডমিন কন্ট্রোলস ====================
-async def show_pending_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE, idx: int) -> None:
-    query = update.callback_query
-    if not is_admin(query.from_user.id):
-        await query.answer("⛔ Admin only", show_alert=True)
-        return
-    await query.answer()
+def btn(text: str, callback_data: str = None, url: str = None, color: str = None) -> dict:
+    item = {"text": text}
+    if callback_data:
+        item["callback_data"] = callback_data
+    if url:
+        item["url"] = url
+    if color and color in STYLE_MAP:
+        item["style"] = STYLE_MAP[color]
+    return item
 
-    pending_list = [w for w in DB["withdraws"].values() if w["status"] == "pending"]
-    if not pending_list:
-        await query.edit_message_text(
-            "✅ বর্তমানে কোনো <b>Pending</b> উইথড্র রিকোয়েস্ট নেই।",
-            parse_mode="HTML",
-            reply_markup=admin_panel_kb(),
+def to_inline_markup(rows: list) -> InlineKeyboardMarkup:
+    keyboard = []
+    for row in rows:
+        kb_row = []
+        for item in row:
+            kwargs = {}
+            if "callback_data" in item:
+                kwargs["callback_data"] = item["callback_data"]
+            if "url" in item:
+                kwargs["url"] = item["url"]
+            kb_row.append(InlineKeyboardButton(item["text"], **kwargs))
+        keyboard.append(kb_row)
+    return InlineKeyboardMarkup(keyboard)
+
+def to_reply_markup(rows: list) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(item["text"]) for item in row] for row in rows],
+        resize_keyboard=True,
+    )
+
+async def send_reply_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    rows: list,
+):
+    chat_id = update.effective_chat.id
+    reply_markup_payload = {
+        "keyboard": rows,
+        "resize_keyboard": True,
+    }
+    try:
+        await context.bot._post(
+            "sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(reply_markup_payload),
+            },
         )
-        return
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=to_reply_markup(rows),
+        )
 
-    idx = max(0, min(idx, len(pending_list) - 1))
-    wd = pending_list[idx]
+async def send_styled_inline(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    rows: list,
+):
+    try:
+        await context.bot._post(
+            "sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps({"inline_keyboard": rows}),
+            },
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=to_inline_markup(rows),
+        )
+
+async def edit_styled_inline(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    rows: list = None,
+):
+    if rows is not None:
+        try:
+            await context.bot._post(
+                "editMessageText",
+                data={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": json.dumps({"inline_keyboard": rows}),
+                },
+            )
+            return
+        except Exception:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=to_inline_markup(rows),
+            )
+            return
+
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+    )
+
+# ================= KEYBOARD ROW BUILDERS =================
+def main_menu_reply_rows(user_id: int) -> list:
+    rows = [
+        [btn("🔗 Refer & Earn", color="green")],
+        [
+            btn("💰 Balance", color="blue"),
+            btn("💸 Withdraw", color="red"),
+        ],
+        [btn("📞 Support", color="green")],
+    ]
+    if user_id == ADMIN_ID:
+        rows.append([btn("⚙️ Admin Panel", color="blue")])
+    return rows
+
+def admin_panel_rows() -> list:
+    return [
+        [
+            btn("📊 Bot Stats", callback_data="adm_stats", color="blue"),
+            btn("📣 Broadcast", callback_data="adm_broadcast", color="green"),
+        ],
+        [
+            btn("⏳ পেন্ডিং উইথড্র", callback_data="adm_pending_wd", color="blue"),
+            btn("💸 উইথড্র সেটিংস", callback_data="adm_wd_settings", color="green"),
+        ],
+        [
+            btn("📋 পেআউট লগ", callback_data="adm_payout_log", color="blue"),
+            btn("🎁 Set Refer Bonus", callback_data="adm_set_bonus", color="green"),
+        ],
+        [
+            btn("📢 Set Force Channel", callback_data="adm_set_channel", color="blue"),
+            btn("🆘 Set Support ID", callback_data="adm_set_support", color="green"),
+        ],
+        [
+            btn("➕ Add Balance", callback_data="adm_add_bal", color="green"),
+            btn("➖ Cut Balance", callback_data="adm_cut_bal", color="red"),
+        ],
+        [
+            btn("🚫 Ban User", callback_data="adm_ban", color="red"),
+            btn("✅ Unban User", callback_data="adm_unban", color="green"),
+        ],
+    ]
+
+# ================= FORCE JOIN CHECK =================
+async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE, data: dict) -> bool:
+    channel = data["settings"].get("force_channel", "").strip()
+    if not channel or user_id == ADMIN_ID:
+        return True
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception as e:
+        logger.warning(f"Force join check error for {channel}: {e}")
+        return True
+
+async def send_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    channel = data["settings"].get("force_channel", "").strip()
+    clean_username = channel.lstrip("@")
+    join_url = f"https://t.me/{clean_username}"
+    rows = [
+        [btn("📢 Join Our Channel", url=join_url, color="blue")],
+        [btn("✅ Joined / Check", callback_data="check_join", color="green")],
+    ]
     text = (
-        f"📥 <b>Pending Withdraw #{wd['id']}</b> ({idx + 1}/{len(pending_list)})\n\n"
-        f"👤 User ID: <code>{wd['user_id']}</code>\n"
-        f"🏷️ Username: {wd.get('username') or 'N/A'}\n"
-        f"💳 Method: <b>{method_label(wd['method'])}</b>\n"
-        f"📱 Account: <code>{wd['account']}</code>\n"
-        f"💵 Request Amount: <b>{wd['amount']:.2f} BDT</b>\n"
-        f"🧾 Fee: <b>{wd['fee']:.2f} BDT</b>\n"
-        f"💸 Payable to User: <b>{wd['net_amount']:.2f} BDT</b>\n"
-        f"🕒 Time: <code>{wd['created_at']}</code>"
+        "🚫 <b>Access Denied!</b>\n\n"
+        "বটটি ব্যবহার করতে হলে অবশ্যই নিচের চ্যানেলে জয়েন করতে হবে।\n"
+        "জয়েন করার পর <b>✅ Joined / Check</b> বাটনে ক্লিক করুন।"
     )
-    await query.edit_message_text(
-        text, parse_mode="HTML", reply_markup=pending_action_kb(str(wd["id"]), idx)
+    await send_styled_inline(context, update.effective_chat.id, text, rows)
+
+# ================= REWARD REFERRER HELPER =================
+async def process_referral_reward(user_id: int, data: dict, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(user_id)
+    user = data["users"].get(uid)
+    if not user:
+        return
+    ref_by = user.get("referred_by")
+    if ref_by and not user.get("refer_paid"):
+        if ref_by in data["users"] and ref_by != uid:
+            bonus = float(data["settings"]["refer_bonus"])
+            data["users"][ref_by]["balance"] += bonus
+            data["users"][ref_by]["earned"] = float(data["users"][ref_by].get("earned", 0.0)) + bonus
+            data["users"][ref_by]["refers"] += 1
+            user["refer_paid"] = True
+            save_data(data)
+            try:
+                await context.bot.send_message(
+                    chat_id=int(ref_by),
+                    text=(
+                        f"🎉 <b>নতুন রেফারেল সফল হয়েছে!</b>\n\n"
+                        f"👤 ইউজার: <b>{user['name']}</b>\n"
+                        f"💰 বোনাস যোগ হয়েছে: <b>+{bonus} ৳</b>"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+# ================= HOME TEXT BUILDER =================
+def build_home_text(first_name: str, data: dict) -> str:
+    return (
+        f"👋 <b>স্বাগতম, {first_name}!</b>\n\n"
+        f"🔥 বন্ধুদের রেফার করুন এবং প্রতি রেফারে আয় করুন <b>{data['settings']['refer_bonus']} ৳</b>!\n"
+        f"নিচের বাটনগুলো থেকে আপনার অপশন বেছে নিন 👇"
     )
 
+# ================= COMMANDS =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_obj = update.effective_user
+    uid = str(user_obj.id)
+    data = load_data()
 
-async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    is_new = uid not in data["users"]
+    user = get_user(data, user_obj.id, user_obj.first_name)
+
+    if user.get("banned") and user_obj.id != ADMIN_ID:
+        await update.message.reply_text("🚫 <b>আপনাকে এই বট থেকে ব্যান করা হয়েছে।</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if is_new and context.args:
+        ref_id = context.args[0]
+        if ref_id.isdigit() and ref_id != uid and ref_id in data["users"]:
+            user["referred_by"] = ref_id
+
+    save_data(data)
+
+    joined = await check_force_join(user_obj.id, context, data)
+    if not joined:
+        await send_force_join_message(update, context, data)
+        return
+
+    await process_referral_reward(user_obj.id, data, context)
+
+    await send_reply_menu(
+        update,
+        context,
+        build_home_text(user_obj.first_name, data),
+        main_menu_reply_rows(user_obj.id),
+    )
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await send_styled_inline(
+        context,
+        update.effective_chat.id,
+        "⚙️ <b>ADMIN CONTROL PANEL</b>\n\nনিচের বাটনগুলো থেকে বটের সব সেটিংস কন্ট্রোল করুন:",
+        admin_panel_rows(),
+    )
+
+# ================= CALLBACK QUERIES =================
+async def show_wd_settings_page(context, chat_id, message_id, data):
+    s = data["settings"]
+    mn_b, mx_b = wd_method_limits(data, "bKash")
+    mn_n, mx_n = wd_method_limits(data, "Nagad")
+    text = (
+        "💸 <b>উইথড্র সেটিংস</b>\n\n"
+        f"🔘 উইথড্র: <b>{s.get('withdraw_enabled', 'ON')}</b>\n"
+        f"🩷 bKash: <b>{s.get('wd_bkash_active', 'ON')}</b> | লিমিট: <b>{mn_b:g}–{mx_b:g} ৳</b>\n"
+        f"🧡 Nagad: <b>{s.get('wd_nagad_active', 'ON')}</b> | লিমিট: <b>{mn_n:g}–{mx_n:g} ৳</b>\n\n"
+        "যেকোনো বাটনে চাপ দিয়ে ON/OFF করুন বা লিমিট বদলান:"
+    )
+    rows = [
+        [btn(f"🔘 উইথড্র: {s.get('withdraw_enabled', 'ON')}", callback_data="adm_wd_toggle_all", color="blue")],
+        [
+            btn(f"🩷 bKash: {s.get('wd_bkash_active', 'ON')}", callback_data="adm_wd_toggle_bkash", color="green"),
+            btn(f"🧡 Nagad: {s.get('wd_nagad_active', 'ON')}", callback_data="adm_wd_toggle_nagad", color="green"),
+        ],
+        [
+            btn("✏️ bKash লিমিট", callback_data="adm_wd_edit_bkash", color="blue"),
+            btn("✏️ Nagad লিমিট", callback_data="adm_wd_edit_nagad", color="blue"),
+        ],
+        [btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")],
+    ]
+    await edit_styled_inline(context, chat_id, message_id, text, rows)
+
+async def show_payout_log_page(context, chat_id, message_id, data):
+    s = data["settings"]
+    text = (
+        "📋 <b>পেআউট লগ</b>\n\n"
+        f"🔘 স্ট্যাটাস: <b>{s.get('payout_log_active', 'OFF')}</b>\n"
+        f"💬 লগ চ্যাট: <b>{s.get('payout_log_chat') or 'সেট করা নেই'}</b>\n\n"
+        "ON থাকলে প্রতিটি নতুন উইথড্র ও পেমেন্টের লগ এই চ্যাটে যাবে।"
+    )
+    rows = [
+        [btn(f"🔘 লগ: {s.get('payout_log_active', 'OFF')}", callback_data="adm_log_toggle", color="green")],
+        [btn("💬 লগ চ্যাট সেট করুন", callback_data="adm_log_set_chat", color="blue")],
+        [btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")],
+    ]
+    await edit_styled_inline(context, chat_id, message_id, text, rows)
+async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data
-    user = query.from_user
+    await query.answer()
+    user_obj = query.from_user
+    user_id = user_obj.id
+    cb_data = query.data
+    data = load_data()
+    user = get_user(data, user_id, user_obj.first_name)
 
-    if data == "main_menu":
-        await query.answer()
-        u_data = ensure_user(user.id, user.username or "", user.full_name or "")
-        context.user_data.clear()
-        await query.edit_message_text(
-            f"👋 <b>Main Menu</b>\n💰 ব্যালেন্স: <b>{u_data['balance']:.2f} BDT</b>",
-            parse_mode="HTML",
-            reply_markup=main_menu_kb(user.id),
+    chat_id = query.message.chat.id
+    message_id = query.message.message_id
+
+    if user.get("banned") and user_id != ADMIN_ID:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🚫 <b>আপনাকে এই বট থেকে ব্যান করা হয়েছে।</b>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    if data == "wd_menu":
-        await show_withdraw_menu(update, context)
-        return
-
-    if data.startswith("wd_pick:"):
-        await pick_withdraw_method(update, context)
-        return
-
-    if data == "my_wd":
-        await show_my_withdraws(update, context)
-        return
-
-    # --- Admin Panel ---
-    if data == "admin_panel":
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        await query.answer()
-        context.user_data.pop("admin_action", None)
-        await query.edit_message_text(
-            "🛠️ <b>Admin Panel</b>", parse_mode="HTML", reply_markup=admin_panel_kb()
-        )
-        return
-
-    if data.startswith("adm_pending:"):
-        idx = int(data.split(":")[1])
-        await show_pending_withdraw(update, context, idx)
-        return
-
-    if data == "adm_settings":
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        await query.answer()
-        context.user_data.pop("admin_action", None)
-        bk = DB["settings"]["bkash"]
-        ng = DB["settings"]["nagad"]
-        text = (
-            "⚙️ <b>Withdraw System Settings (bKash & Nagad)</b>\n\n"
-            f"<b>bKash</b>: {'ON' if bk['enabled'] else 'OFF'} | Min: {bk['min']} | Max: {bk['max']} | Fee: {bk['fee']} ({bk['fee_type']})\n"
-            f"<b>Nagad</b>: {'ON' if ng['enabled'] else 'OFF'} | Min: {ng['min']} | Max: {ng['max']} | Fee: {ng['fee']} ({ng['fee_type']})"
-        )
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=admin_settings_kb())
-        return
-
-    if data.startswith("adm_toggle:"):
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        method = data.split(":")[1]
-        DB["settings"][method]["enabled"] = not DB["settings"][method]["enabled"]
-        save_data(DB)
-        await query.answer(f"{method_label(method)} updated!")
-        query.data = "adm_settings"
-        await handle_callbacks(update, context)
-        return
-
-    if data.startswith("adm_edit_menu:"):
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        await query.answer()
-        method = data.split(":")[1]
-        await query.edit_message_text(
-            f"✏️ <b>{method_label(method)} Settings</b>\nকী আপডেট করতে চান তা বেছে নিন:",
-            parse_mode="HTML",
-            reply_markup=edit_method_kb(method),
-        )
-        return
-
-    if data.startswith("adm_set:"):
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        await query.answer()
-        _, method, field = data.split(":")
-        context.user_data["admin_action"] = {"type": "set_config", "method": method, "field": field}
-        if field == "limits":
-            prompt = (
-                f"<b>{method_label(method)} Min/Max Limit</b> লিখুন\n"
-                f"ফরম্যাট: <code>min max</code> (যেমন: <code>100 20000</code>)"
+    if cb_data == "check_join":
+        joined = await check_force_join(user_id, context, data)
+        if joined:
+            await process_referral_reward(user_id, data, context)
+            await query.message.delete()
+            await send_reply_menu(
+                update,
+                context,
+                build_home_text(user_obj.first_name, data),
+                main_menu_reply_rows(user_id),
             )
         else:
-            prompt = (
-                f"<b>{method_label(method)} Charge</b> লিখুন\n"
-                f"ফরম্যাট: <code>fixed 10</code> অথবা <code>percent 2</code>"
-            )
-        await query.edit_message_text(
-            prompt,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data="adm_settings")]]
-            ),
+            await query.answer("❌ আপনি এখনো চ্যানেলে জয়েন করেননি!", show_alert=True)
+        return
+
+    # Withdraw Method Selection (bKash & Nagad Only)
+    if cb_data.startswith("wd_method_"):
+        method = cb_data.replace("wd_method_", "")
+        if method not in WD_METHODS:
+            await query.answer("❌ শুধুমাত্র bKash এবং Nagad সাপোর্ট করে।", show_alert=True)
+            return
+        if method not in wd_active_methods(data):
+            await query.answer("❌ এই মেথডের উইথড্র এখন বন্ধ আছে।", show_alert=True)
+            return
+        mn, mx = wd_method_limits(data, method)
+        context.user_data["wd_method"] = method
+        context.user_data["state"] = "WAIT_WD_NUMBER"
+        await edit_styled_inline(
+            context,
+            chat_id,
+            message_id,
+            f"📲 <b>{method}</b> সিলেক্ট করা হয়েছে।\n\n"
+            f"🔻 সর্বনিম্ন: <b>{mn:g} ৳</b> | 🔺 সর্বোচ্চ: <b>{mx:g} ৳</b>\n\n"
+            f"এখন আপনার <b>{method} পার্সোনাল নম্বরটি</b> লিখে পাঠান:\n"
+            f"<i>(১১ ডিজিটের নম্বর দিন, বাতিল করতে /cancel লিখুন)</i>",
         )
         return
 
-    if data.startswith("adm_app:"):
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
+    # Admin Withdraw Approve / Reject
+    if cb_data.startswith("wd_approve_") or cb_data.startswith("wd_reject_"):
+        if user_id != ADMIN_ID:
             return
-        _, wid, idx_s = data.split(":")
-        wd = DB["withdraws"].get(wid)
-        if not wd or wd["status"] != "pending":
-            await query.answer("Already processed or not found", show_alert=True)
-            await show_pending_withdraw(update, context, int(idx_s))
-            return
-        wd["status"] = "approved"
-        wd["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        save_data(DB)
-        await query.answer("✅ Approved!")
-
-        try:
-            await context.bot.send_message(
-                chat_id=int(wd["user_id"]),
-                text=(
-                    f"✅ <b>Withdraw Approved (#{wd['id']})</b>\n\n"
-                    f"Method: <b>{method_label(wd['method'])}</b>\n"
-                    f"Account: <code>{wd['account']}</code>\n"
-                    f"Paid Amount: <b>{wd['net_amount']:.2f} BDT</b>"
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error(f"Notify user error: {e}")
-
-        await send_payout_log(context, wd, f"Approved by Admin {user.id}")
-        await show_pending_withdraw(update, context, int(idx_s))
-        return
-
-    if data.startswith("adm_proof:"):
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        await query.answer()
-        _, wid, idx_s = data.split(":")
-        context.user_data["admin_action"] = {
-            "type": "proof_photo",
-            "wid": wid,
-            "idx": int(idx_s),
-        }
-        await query.edit_message_text(
-            f"📸 Withdraw <b>#{wid}</b>-এর পেমেন্ট স্ক্রিনশট (Photo) পাঠান:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("❌ Cancel", callback_data=f"adm_pending:{idx_s}")]]
-            ),
-        )
-        return
-
-    if data.startswith("adm_rej:"):
-        if not is_admin(user.id):
-            await query.answer("⛔ Admin only", show_alert=True)
-            return
-        _, wid, idx_s = data.split(":")
-        wd = DB["withdraws"].get(wid)
-        if not wd or wd["status"] != "pending":
-            await query.answer("Already processed or not found", show_alert=True)
-            await show_pending_withdraw(update, context, int(idx_s))
+        parts = cb_data.split("_")
+        action, wd_id = parts[1], parts[2]
+        wd = data["withdraws"].get(wd_id)
+        if not wd:
+            await query.answer("⚠️ এই রিকোয়েস্ট পাওয়া যায়নি!", show_alert=True)
             return
 
-        wd["status"] = "rejected"
-        wd["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        uid_str = wd["user_id"]
-        if uid_str in DB["users"]:
-            DB["users"][uid_str]["balance"] = round(
-                DB["users"][uid_str]["balance"] + float(wd["amount"]), 2
-            )
-        save_data(DB)
-        await query.answer("❌ Rejected & Refunded!")
-
-        try:
-            await context.bot.send_message(
-                chat_id=int(uid_str),
-                text=(
-                    f"❌ <b>Withdraw Rejected (#{wd['id']})</b>\n\n"
-                    f"Amount: <b>{wd['amount']:.2f} BDT</b> আপনার ব্যালেন্সে রিফান্ড করা হয়েছে।"
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error(f"Refund notify error: {e}")
-
-        await send_payout_log(context, wd, f"Rejected & Refunded by Admin {user.id}")
-        await show_pending_withdraw(update, context, int(idx_s))
-        return
-
-
-# ==================== টেক্সট ও ফটো হ্যান্ডলার ====================
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    text = (update.message.text or "").strip()
-
-    # 1. অ্যাডমিন কনফিগ সেটিংস ইনপুট
-    adm_act = context.user_data.get("admin_action")
-    if adm_act and is_admin(user.id) and adm_act.get("type") == "set_config":
-        method = adm_act["method"]
-        field = adm_act["field"]
-        parts = text.split()
-        try:
-            if field == "limits" and len(parts) == 2:
-                min_v, max_v = float(parts[0]), float(parts[1])
-                if min_v < 0 or max_v < min_v:
-                    raise ValueError
-                DB["settings"][method]["min"] = min_v
-                DB["settings"][method]["max"] = max_v
-            elif field == "fee" and len(parts) == 2:
-                f_type = parts[0].lower()
-                f_val = float(parts[1])
-                if f_type not in ("fixed", "percent") or f_val < 0:
-                    raise ValueError
-                DB["settings"][method]["fee_type"] = f_type
-                DB["settings"][method]["fee"] = f_val
-            else:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("❌ ভুল ফরম্যাট! আবার সঠিক মান লিখে পাঠান।")
-            return
-
-        save_data(DB)
-        context.user_data.pop("admin_action", None)
-        await update.message.reply_text(
-            f"✅ <b>{method_label(method)}</b> সেটিংস আপডেট হয়েছে!",
-            parse_mode="HTML",
-            reply_markup=admin_settings_kb(),
-        )
-        return
-
-    # 2. ইউজার উইথড্র ফ্লো
-    wd_flow = context.user_data.get("wd_flow")
-    if wd_flow:
-        method = wd_flow["method"]
-        cfg = DB["settings"][method]
-        u_data = ensure_user(user.id, user.username or "", user.full_name or "")
-
-        if wd_flow["step"] == "account":
-            if len(text) < 6:
-                await update.message.reply_text("❌ সঠিক অ্যাকাউন্ট নম্বর দিন।")
+        if action == "approve":
+            ok, err = approve_withdraw(data, wd_id)
+            if not ok:
+                await query.answer(err, show_alert=True)
                 return
-            wd_flow["account"] = text
-            wd_flow["step"] = "amount"
-            await update.message.reply_text(
-                f"💵 কত টাকা উইথড্র করতে চান?\n"
-                f"• Balance: <b>{u_data['balance']:.2f} BDT</b>\n"
-                f"• Min: <b>{cfg['min']:.2f} BDT</b> | Max: <b>{cfg['max']:.2f} BDT</b>",
-                parse_mode="HTML",
+            await edit_styled_inline(
+                context,
+                chat_id,
+                message_id,
+                query.message.text_html + "\n\n✅ <b>STATUS: APPROVED BY ADMIN</b>",
             )
-            return
-
-        if wd_flow["step"] == "amount":
+            await post_payout_log(context, data, "paid", {**wd, "wd_id": wd_id})
             try:
-                amount = round(float(text), 2)
-            except ValueError:
-                await update.message.reply_text(
-                    "❌ বৈধ সংখ্যায় অ্যামাউন্ট লিখুন (যেমন: <code>500</code>)।",
-                    parse_mode="HTML",
+                await context.bot.send_message(
+                    chat_id=int(wd["user_id"]),
+                    text=(
+                        f"✅ <b>আপনার উইথড্র সফলভাবে পেমেন্ট করা হয়েছে!</b>\n\n"
+                        f"🆔 ট্রানজেকশন আইডি: <code>#{wd_id}</code>\n"
+                        f"💳 মেথড: <b>{wd['method']}</b>\n"
+                        f"📱 নম্বর: <code>{wd['number']}</code>\n"
+                        f"💰 পরিমাণ: <b>{wd['amount']} ৳</b>"
+                    ),
+                    parse_mode=ParseMode.HTML,
                 )
+            except Exception:
+                pass
+        else:
+            ok, err = reject_withdraw(data, wd_id)
+            if not ok:
+                await query.answer(err, show_alert=True)
                 return
-
-            if amount < cfg["min"] or amount > cfg["max"]:
-                await update.message.reply_text(
-                    f"❌ অ্যামাউন্ট অবশ্যই <b>{cfg['min']:.2f}</b> থেকে <b>{cfg['max']:.2f} BDT</b>-এর মধ্যে হতে হবে।",
-                    parse_mode="HTML",
-                )
-                return
-
-            if amount > u_data["balance"]:
-                await update.message.reply_text(
-                    f"❌ পর্যাপ্ত ব্যালেন্স নেই! আপনার ব্যালেন্স: <b>{u_data['balance']:.2f} BDT</b>।",
-                    parse_mode="HTML",
-                )
-                return
-
-            fee = calc_fee(method, amount)
-            net_amount = round(max(0.0, amount - fee), 2)
-            if net_amount <= 0:
-                await update.message.reply_text("❌ চার্জ বাদ দেওয়ার পর নেট অ্যামাউন্ট শূন্য বা কম হচ্ছে।")
-                return
-
-            # ব্যালেন্স কেটে Pending রিকোয়েস্ট তৈরি
-            u_data["balance"] = round(u_data["balance"] - amount, 2)
-            wid = DB["next_wid"]
-            DB["next_wid"] += 1
-
-            wd_record = {
-                "id": wid,
-                "user_id": str(user.id),
-                "username": f"@{user.username}" if user.username else "",
-                "name": user.full_name or "",
-                "method": method,
-                "account": wd_flow["account"],
-                "amount": amount,
-                "fee": fee,
-                "net_amount": net_amount,
-                "status": "pending",
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            DB["withdraws"][str(wid)] = wd_record
-            save_data(DB)
-            context.user_data.pop("wd_flow", None)
-
-            # ইউজারকে রিসিপ্ট পাঠানো
-            receipt = (
-                f"🧾 <b>Withdraw Request Submitted (#{wid})</b>\n\n"
-                f"Status: ⏳ <b>Pending</b>\n"
-                f"Method: <b>{method_label(method)}</b>\n"
-                f"Account: <code>{wd_record['account']}</code>\n"
-                f"Amount: <b>{amount:.2f} BDT</b>\n"
-                f"Fee: <b>{fee:.2f} BDT</b>\n"
-                f"Net Payable: <b>{net_amount:.2f} BDT</b>\n"
-                f"Remaining Balance: <b>{u_data['balance']:.2f} BDT</b>"
+            await edit_styled_inline(
+                context,
+                chat_id,
+                message_id,
+                query.message.text_html + "\n\n❌ <b>STATUS: REJECTED (REFUNDED)</b>",
             )
-            await update.message.reply_text(
-                receipt, parse_mode="HTML", reply_markup=main_menu_kb(user.id)
-            )
-            await send_payout_log(context, wd_record)
+            try:
+                await context.bot.send_message(
+                    chat_id=int(wd["user_id"]),
+                    text=(
+                        f"❌ <b>আপনার উইথড্র রিকোয়েস্ট বাতিল করা হয়েছে!</b>\n"
+                        f"💰 <b>{wd['amount']} ৳</b> আপনার ব্যালেন্সে ফেরত দেওয়া হয়েছে।"
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+        return
+
+    # Admin Panel Callbacks
+    if cb_data.startswith("adm_"):
+        if user_id != ADMIN_ID:
             return
 
-    await update.message.reply_text(
-        "মেনু দেখতে /start অথবা অ্যাডমিন প্যানেলের জন্য /admin চাপুন।"
-    )
+        if cb_data == "adm_stats":
+            total_users = len(data["users"])
+            banned_users = sum(1 for u in data["users"].values() if u.get("banned"))
+            pending_wd = sum(1 for w in data["withdraws"].values() if w["status"] == "pending")
+            s = data["settings"]
+            mn_b, mx_b = wd_method_limits(data, "bKash")
+            mn_n, mx_n = wd_method_limits(data, "Nagad")
+            wd_status = "✅ ON" if withdraw_allowed(data) else "❌ OFF"
+            stats_text = (
+                "📊 <b>BOT LIVE STATISTICS</b>\n\n"
+                f"👥 মোট ইউজার: <b>{total_users}</b>\n"
+                f"🚫 ব্যান ইউজার: <b>{banned_users}</b>\n"
+                f"⏳ পেন্ডিং উইথড্র: <b>{pending_wd}</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"🎁 রেফার বোনাস: <b>{s['refer_bonus']} ৳</b>\n"
+                f"💸 উইথড্র: <b>{wd_status}</b>\n"
+                f"🩷 bKash: <b>{mn_b:g}–{mx_b:g} ৳</b> ({s.get('wd_bkash_active', 'ON')})\n"
+                f"🧡 Nagad: <b>{mn_n:g}–{mx_n:g} ৳</b> ({s.get('wd_nagad_active', 'ON')})\n"
+                f"📢 ফোর্স চ্যানেল: <b>{s['force_channel'] or 'Off'}</b>\n"
+                f"🆘 সাপোর্ট আইডি: <b>{s['support_id']}</b>"
+            )
+            await edit_styled_inline(context, chat_id, message_id, stats_text, admin_panel_rows())
+            return
 
+        if cb_data == "adm_menu":
+            await edit_styled_inline(
+                context,
+                chat_id,
+                message_id,
+                "⚙️ <b>ADMIN CONTROL PANEL</b>\n\nনিচের বাটনগুলো থেকে বটের সব সেটিংস কন্ট্রোল করুন:",
+                admin_panel_rows(),
+            )
+            return
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    adm_act = context.user_data.get("admin_action")
-    if not (adm_act and is_admin(user.id) and adm_act.get("type") == "proof_photo"):
-        return
+        if cb_data == "adm_pending_wd":
+            pending = sorted(
+                [(int(wid), w) for wid, w in data["withdraws"].items() if w.get("status") == "pending"],
+                key=lambda x: x[0],
+                reverse=True,
+            )[:10]
+            if not pending:
+                await edit_styled_inline(
+                    context, chat_id, message_id,
+                    "✅ <b>কোনো পেন্ডিং উইথড্র রিকোয়েস্ট নেই।</b>",
+                    [[btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")]],
+                )
+                return
+            text = "⏳ <b>পেন্ডিং উইথড্র রিকোয়েস্ট</b>\n\n"
+            rows = []
+            for wid, w in pending:
+                text += (
+                    f"🆔 <code>#{wid}</code> | {w['method']} | <b>{w['amount']} ৳</b> | "
+                    f"<code>{w['number']}</code> | {w.get('user_name', '')}\n"
+                )
+                rows.append([
+                    btn(f"✅ App #{wid}", callback_data=f"wd_approve_{wid}", color="green"),
+                    btn(f"❌ Rej #{wid}", callback_data=f"wd_reject_{wid}", color="red"),
+                ])
+            rows.append([btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")])
+            await edit_styled_inline(context, chat_id, message_id, text, rows)
+            return
 
-    wid = adm_act["wid"]
-    wd = DB["withdraws"].get(wid)
-    context.user_data.pop("admin_action", None)
+        if cb_data == "adm_wd_settings":
+            await show_wd_settings_page(context, chat_id, message_id, data)
+            return
 
-    if not wd or wd["status"] != "pending":
-        await update.message.reply_text("❌ এই রিকোয়েস্টটি আর Pending অবস্থায় নেই।")
-        return
+        if cb_data in ("adm_wd_toggle_all", "adm_wd_toggle_bkash", "adm_wd_toggle_nagad"):
+            key = {
+                "adm_wd_toggle_all": "withdraw_enabled",
+                "adm_wd_toggle_bkash": "wd_bkash_active",
+                "adm_wd_toggle_nagad": "wd_nagad_active",
+            }[cb_data]
+            cur = str(data["settings"].get(key, "ON")).upper()
+            data["settings"][key] = "OFF" if cur == "ON" else "ON"
+            save_data(data)
+            await query.answer(f"✅ {key}: {data['settings'][key]}")
+            await show_wd_settings_page(context, chat_id, message_id, data)
+            return
 
-    photo_id = update.message.photo[-1].file_id
-    wd["status"] = "approved"
-    wd["proof_photo_id"] = photo_id
-    wd["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_data(DB)
-
-    caption_user = (
-        f"✅ <b>Withdraw Paid & Approved (#{wd['id']})</b>\n\n"
-        f"Method: <b>{method_label(wd['method'])}</b>\n"
-        f"Account: <code>{wd['account']}</code>\n"
-        f"Paid Amount: <b>{wd['net_amount']:.2f} BDT</b>"
-    )
-    try:
-        await context.bot.send_photo(
-            chat_id=int(wd["user_id"]),
-            photo=photo_id,
-            caption=caption_user,
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error(f"Send proof photo error: {e}")
-
-    if PAYOUT_LOG_CHANNEL:
-        try:
-            await context.bot.send_photo(
-                chat_id=PAYOUT_LOG_CHANNEL,
-                photo=photo_id,
-                caption=(
-                    f"📸 <b>Paid Proof (#{wd['id']})</b>\n"
-                    f"User: <code>{wd['user_id']}</code> | Method: <b>{method_label(wd['method'])}</b>\n"
-                    f"Account: <code>{wd['account']}</code> | Paid: <b>{wd['net_amount']:.2f} BDT</b>"
+        if cb_data in ("adm_wd_edit_bkash", "adm_wd_edit_nagad"):
+            method = "bKash" if cb_data == "adm_wd_edit_bkash" else "Nagad"
+            mn, mx = wd_method_limits(data, method)
+            context.user_data["state"] = f"WAIT_ADM_WD_{method.upper()}"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✏️ <b>{method} উইথড্র লিমিট সেট করুন:</b>\n\n"
+                    f"বর্তমান সর্বনিম্ন: <code>{mn:g}</code> | সর্বোচ্চ: <code>{mx:g}</code>\n\n"
+                    f"ফরম্যাট: <code>সর্বনিম্ন সর্বোচ্চ</code> (যেমন: <code>50 5000</code>)"
+                    "\n\n<i>বাতিল করতে /cancel লিখুন</i>"
                 ),
-                parse_mode="HTML",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if cb_data == "adm_payout_log":
+            await show_payout_log_page(context, chat_id, message_id, data)
+            return
+
+        if cb_data == "adm_log_toggle":
+            cur = str(data["settings"].get("payout_log_active", "OFF")).upper()
+            data["settings"]["payout_log_active"] = "OFF" if cur == "ON" else "ON"
+            save_data(data)
+            await query.answer(f"✅ পেআউট লগ: {data['settings']['payout_log_active']}")
+            await show_payout_log_page(context, chat_id, message_id, data)
+            return
+
+        if cb_data == "adm_log_set_chat":
+            context.user_data["state"] = "WAIT_ADM_LOGCHAT"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "💬 <b>পেআউট লগ চ্যাট সেট করুন:</b>\n\n"
+                    "লগ চ্যানেল/গ্রুপের <code>chat ID</code> দিন (যেমন: <code>-1001234567890</code>)।\n"
+                    "বন্ধ করতে <code>off</code> লিখুন।"
+                    "\n\n<i>বাতিল করতে /cancel লিখুন</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        prompts = {
+            "adm_set_bonus": ("WAIT_ADM_BONUS", "🎁 প্রতি রেফারে কত টাকা বোনাস দিতে চান? (যেমন: <code>2</code> বা <code>5</code>)"),
+            "adm_set_channel": ("WAIT_ADM_CHANNEL", "📢 ফোর্স জয়েন চ্যানেলের <code>@username</code> দিন (বটকে চ্যানেলে অ্যাডমিন রাখবেন)। অফ করতে <code>off</code> লিখুন:"),
+            "adm_set_support": ("WAIT_ADM_SUPPORT", "🆘 সাপোর্ট অ্যাডমিনের <code>@username</code> বা লিংক দিন:"),
+            "adm_add_bal": ("WAIT_ADM_ADDBAL", "➕ টাকা যোগ করতে <code>USER_ID AMOUNT</code> লিখুন:\n(উদাহরণ: <code>123456789 50</code>)"),
+            "adm_cut_bal": ("WAIT_ADM_CUTBAL", "➖ টাকা কাটতে <code>USER_ID AMOUNT</code> লিখুন:\n(উদাহরণ: <code>123456789 20</code>)"),
+            "adm_ban": ("WAIT_ADM_BAN", "🚫 ব্যান করতে ইউজারের <code>USER_ID</code> দিন:"),
+            "adm_unban": ("WAIT_ADM_UNBAN", "✅ আনব্যান করতে ইউজারের <code>USER_ID</code> দিন:"),
+            "adm_broadcast": ("WAIT_ADM_BROADCAST", "📣 সব ইউজারকে পাঠানোর জন্য আপনার মেসেজটি লিখুন:"),
+        }
+
+        if cb_data in prompts:
+            state, msg = prompts[cb_data]
+            context.user_data["state"] = state
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=msg + "\n\n<i>বাতিল করতে /cancel লিখুন</i>",
+                parse_mode=ParseMode.HTML,
+            )
+
+# ================= TEXT MESSAGE HANDLER =================
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_obj = update.effective_user
+    uid = str(user_obj.id)
+    text = update.message.text.strip()
+    data = load_data()
+    user = get_user(data, user_obj.id, user_obj.first_name)
+
+    if user.get("banned") and user_obj.id != ADMIN_ID:
+        await update.message.reply_text("🚫 <b>আপনাকে এই বট থেকে ব্যান করা হয়েছে।</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if text == "/cancel":
+        context.user_data.clear()
+        await send_reply_menu(
+            update,
+            context,
+            "✅ বর্তমান কাজ বাতিল করা হয়েছে।",
+            main_menu_reply_rows(user_obj.id),
+        )
+        return
+
+    state = context.user_data.get("state")
+
+    # Admin Input States
+    if user_obj.id == ADMIN_ID and state and state.startswith("WAIT_ADM_"):
+        context.user_data.clear()
+        try:
+            if state == "WAIT_ADM_BONUS":
+                val = float(text)
+                data["settings"]["refer_bonus"] = val
+                save_data(data)
+                await update.message.reply_text(f"✅ রেফার বোনাস <b>{val} ৳</b> সেট করা হয়েছে!", parse_mode=ParseMode.HTML)
+
+            elif state == "WAIT_ADM_WD_BKASH":
+                mn, mx = [float(x) for x in text.split()]
+                if mn < 0 or mx <= mn:
+                    raise ValueError("সর্বনিম্ন ০ বা তার বেশি এবং সর্বোচ্চ সর্বনিম্নের চেয়ে বড় হতে হবে।")
+                data["settings"]["min_withdraw_bkash"] = mn
+                data["settings"]["max_withdraw_bkash"] = mx
+                save_data(data)
+                await update.message.reply_text(f"✅ bKash লিমিট সেট হয়েছে: <b>{mn:g}–{mx:g} ৳</b>", parse_mode=ParseMode.HTML)
+
+            elif state == "WAIT_ADM_WD_NAGAD":
+                mn, mx = [float(x) for x in text.split()]
+                if mn < 0 or mx <= mn:
+                    raise ValueError("সর্বনিম্ন ০ বা তার বেশি এবং সর্বোচ্চ সর্বনিম্নের চেয়ে বড় হতে হবে।")
+                data["settings"]["min_withdraw_nagad"] = mn
+                data["settings"]["max_withdraw_nagad"] = mx
+                save_data(data)
+                await update.message.reply_text(f"✅ Nagad লিমিট সেট হয়েছে: <b>{mn:g}–{mx:g} ৳</b>", parse_mode=ParseMode.HTML)
+
+            elif state == "WAIT_ADM_LOGCHAT":
+                data["settings"]["payout_log_chat"] = "" if text.lower() == "off" else text
+                save_data(data)
+                await update.message.reply_text(f"✅ পেআউট লগ চ্যাট আপডেট হয়েছে: <b>{data['settings']['payout_log_chat'] or 'Off'}</b>", parse_mode=ParseMode.HTML)
+
+            elif state == "WAIT_ADM_CHANNEL":
+                data["settings"]["force_channel"] = "" if text.lower() == "off" else text
+                save_data(data)
+                await update.message.reply_text(f"✅ ফোর্স চ্যানেল আপডেট হয়েছে: <b>{data['settings']['force_channel'] or 'Off'}</b>", parse_mode=ParseMode.HTML)
+
+            elif state == "WAIT_ADM_SUPPORT":
+                data["settings"]["support_id"] = text
+                save_data(data)
+                await update.message.reply_text(f"✅ সাপোর্ট আইডি আপডেট হয়েছে: <b>{text}</b>", parse_mode=ParseMode.HTML)
+
+            elif state == "WAIT_ADM_ADDBAL":
+                target_id, amt = text.split()
+                amt = float(amt)
+                if target_id in data["users"]:
+                    data["users"][target_id]["balance"] += amt
+                    save_data(data)
+                    await update.message.reply_text(f"✅ ইউজার <code>{target_id}</code>-এর ব্যালেন্সে <b>+{amt} ৳</b> যোগ হয়েছে!", parse_mode=ParseMode.HTML)
+                else:
+                    await update.message.reply_text("❌ এই আইডির কোনো ইউজার পাওয়া যায়নি।")
+
+            elif state == "WAIT_ADM_CUTBAL":
+                target_id, amt = text.split()
+                amt = float(amt)
+                if target_id in data["users"]:
+                    data["users"][target_id]["balance"] = max(0.0, data["users"][target_id]["balance"] - amt)
+                    save_data(data)
+                    await update.message.reply_text(f"✅ ইউজার <code>{target_id}</code>-এর ব্যালেন্স থেকে <b>-{amt} ৳</b> কাটা হয়েছে!", parse_mode=ParseMode.HTML)
+                else:
+                    await update.message.reply_text("❌ এই আইডির কোনো ইউজার পাওয়া যায়নি।")
+
+            elif state == "WAIT_ADM_BAN":
+                if text in data["users"]:
+                    data["users"][text]["banned"] = True
+                    save_data(data)
+                    await update.message.reply_text(f"🚫 ইউজার <code>{text}</code>-কে ব্যান করা হয়েছে!", parse_mode=ParseMode.HTML)
+                else:
+                    await update.message.reply_text("❌ ইউজার পাওয়া যায়নি।")
+
+            elif state == "WAIT_ADM_UNBAN":
+                if text in data["users"]:
+                    data["users"][text]["banned"] = False
+                    save_data(data)
+                    await update.message.reply_text(f"✅ ইউজার <code>{text}</code>-কে আনব্যান করা হয়েছে!", parse_mode=ParseMode.HTML)
+                else:
+                    await update.message.reply_text("❌ ইউজার পাওয়া যায়নি।")
+
+            elif state == "WAIT_ADM_BROADCAST":
+                sent, failed = 0, 0
+                await update.message.reply_text("⏳ ব্রডকাস্ট পাঠানো শুরু হয়েছে...")
+                for u_key in list(data["users"].keys()):
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(u_key),
+                            text=f"📢 <b>Admin Notice:</b>\n\n{text}",
+                            parse_mode=ParseMode.HTML,
+                        )
+                        sent += 1
+                    except Exception:
+                        failed += 1
+                await update.message.reply_text(
+                    f"✅ <b>ব্রডকাস্ট সম্পন্ন!</b>\n📤 সফল: <b>{sent}</b>\n❌ ব্যর্থ: <b>{failed}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ ভুল ফরম্যাট দেওয়া হয়েছে! আবার চেষ্টা করুন।\nError: {e}")
+        return
+
+    if not await check_force_join(user_obj.id, context, data):
+        await send_force_join_message(update, context, data)
+        return
+
+    # User Withdraw States
+    if state == "WAIT_WD_NUMBER":
+        method = context.user_data.get("wd_method", "bKash")
+        if not (text.isdigit() and len(text) == 11):
+            await update.message.reply_text(
+                "❌ সঠিক ১১ ডিজিটের পার্সোনাল নম্বর দিন (যেমন: 01XXXXXXXXX):"
+            )
+            return
+        context.user_data["wd_number"] = text
+        context.user_data["state"] = "WAIT_WD_AMOUNT"
+        mn, mx = wd_method_limits(data, method)
+        await update.message.reply_text(
+            f"💰 আপনার বর্তমান ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
+            f"🔻 সর্বনিম্ন: <b>{mn:g} ৳</b> | 🔺 সর্বোচ্চ: <b>{mx:g} ৳</b>\n\n"
+            f"কত টাকা উইথড্র করতে চান তা লিখুন:",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if state == "WAIT_WD_AMOUNT":
+        try:
+            amount = float(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ দয়া করে সঠিক সংখ্যায় টাকার পরিমাণ লিখুন (যেমন: 100):")
+            return
+
+        method = context.user_data.get("wd_method", "bKash")
+        ok, err = wd_validate_amount(data, method, amount, float(user["balance"]))
+        if not ok:
+            await update.message.reply_text(err, parse_mode=ParseMode.HTML)
+            return
+
+        number = context.user_data.get("wd_number", "")
+        context.user_data.clear()
+
+        wd_id = create_withdraw(data, uid, user_obj.first_name, method, number, amount)
+
+        await send_reply_menu(
+            update,
+            context,
+            f"✅ <b>আপনার উইথড্র রিকোয়েস্ট সফলভাবে জমা হয়েছে!</b>\n\n"
+            f"🆔 রিকোয়েস্ট আইডি: <code>#{wd_id}</code>\n"
+            f"💳 মেথড: <b>{method}</b>\n"
+            f"📱 নম্বর: <code>{number}</code>\n"
+            f"💰 পরিমাণ: <b>{amount} ৳</b>\n\n"
+            f"⏳ অ্যাডমিন চেক করে দ্রুত পেমেন্ট করে দেবেন।",
+            main_menu_reply_rows(user_obj.id),
+        )
+
+        admin_rows = [
+            [
+                btn("✅ Approve", callback_data=f"wd_approve_{wd_id}", color="green"),
+                btn("❌ Reject", callback_data=f"wd_reject_{wd_id}", color="red"),
+            ]
+        ]
+        try:
+            await send_styled_inline(
+                context,
+                ADMIN_ID,
+                f"🔔 <b>NEW WITHDRAW REQUEST (#{wd_id})</b>\n\n"
+                f"👤 ইউজার: <b>{user_obj.first_name}</b> (<code>{uid}</code>)\n"
+                f"👥 মোট রেফার: <b>{user['refers']}</b>\n"
+                f"💳 মেথড: <b>{method}</b>\n"
+                f"📱 নম্বর: <code>{number}</code>\n"
+                f"💰 পরিমাণ: <b>{amount} ৳</b>",
+                rows=admin_rows,
             )
         except Exception as e:
-            logger.error(f"Channel proof error: {e}")
+            logger.error(f"Failed to send admin withdraw alert: {e}")
+        await post_payout_log(context, data, "pending", {
+            "wd_id": wd_id, "user_id": uid, "user_name": user_obj.first_name,
+            "method": method, "number": number, "amount": amount,
+        })
+        return
 
-    await update.message.reply_text(
-        f"✅ Withdraw <b>#{wid}</b> স্ক্রিনশটসহ Approve করা হয়েছে!",
-        parse_mode="HTML",
-        reply_markup=admin_panel_kb(),
-    )
+    # Reply Keyboard Menu Handlers
+    if text == "🔗 Refer & Earn":
+        bot_username = context.bot.username
+        ref_link = f"https://t.me/{bot_username}?start={uid}"
+        bonus = data["settings"]["refer_bonus"]
+        share_url = f"https://t.me/share/url?url={ref_link}&text=🔥 প্রতি রেফারে {bonus} টাকা আয় করুন!"
+        rows = [[btn("📤 বন্ধুদের সাথে শেয়ার করুন", url=share_url, color="green")]]
+        ref_text = (
+            f"🔗 <b>আপনার রেফারেল লিংক:</b>\n"
+            f"<code>{ref_link}</code>\n\n"
+            f"🎁 প্রতি সফল রেফারে পাবেন: <b>{bonus} ৳</b>\n"
+            f"👥 আপনার মোট রেফার: <b>{user['refers']} জন</b>"
+        )
+        await send_styled_inline(context, update.effective_chat.id, ref_text, rows)
 
+    elif text == "💰 Balance":
+        stats = user_wallet_stats(data, uid)
+        bal_text = (
+            f"👤 <b>আপনার অ্যাকাউন্ট তথ্য</b>\n\n"
+            f"🆔 ইউজার আইডি: <code>{uid}</code>\n"
+            f"💰 বর্তমান ব্যালেন্স: <b>{stats['balance']} ৳</b>\n"
+            f"⏳ পেন্ডিং উইথড্র: <b>{stats['pending_withdraw']} ৳</b>\n"
+            f"🎁 আজীবন আয়: <b>{stats['earned']} ৳</b>\n"
+            f"👥 মোট সফল রেফার: <b>{user['refers']} জন</b>\n"
+            f"🎁 প্রতি রেফার বোনাস: <b>{data['settings']['refer_bonus']} ৳</b>\n\n"
+            f"💸 উইথড্র হিসাব — ✅ অনুমোদিত: <b>{stats['approved']}</b> | "
+            f"⏳ পেন্ডিং: <b>{stats['pending_count']}</b> | "
+            f"❌ বাতিল: <b>{stats['rejected']}</b>"
+        )
+        await update.message.reply_text(bal_text, parse_mode=ParseMode.HTML)
 
-def main() -> None:
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("BOT_TOKEN environment variable সেট করুন।")
+    elif text == "💸 Withdraw":
+        if not withdraw_allowed(data):
+            await update.message.reply_text(
+                "❌ <b>উইথড্র এখন বন্ধ আছে!</b>\n\nঅ্যাডমিন উইথড্র বন্ধ রেখেছেন। পরে আবার চেষ্টা করুন।",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        active = wd_active_methods(data)
+        min_wd = min(wd_method_limits(data, m)[0] for m in active)
+        if user["balance"] < min_wd:
+            await update.message.reply_text(
+                f"❌ <b>পর্যাপ্ত ব্যালেন্স নেই!</b>\n\n"
+                f"💰 আপনার ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
+                f"📉 সর্বনিম্ন উইথড্র: <b>{min_wd:g} ৳</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        rows = []
+        for m in active:
+            mn, mx = wd_method_limits(data, m)
+            color = "red" if m == "bKash" else "green"
+            emoji = "🩷" if m == "bKash" else "🧡"
+            rows.append([btn(f"{emoji} {m} ({mn:g}–{mx:g} ৳)", callback_data=f"wd_method_{m}", color=color)])
+        await send_styled_inline(context, update.effective_chat.id, "💳 <b>পেমেন্ট মেথড সিলেক্ট করুন:</b>", rows)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("admin", admin_cmd))
-    app.add_handler(CommandHandler("addbal", addbal_cmd))
+    elif text == "📞 Support":
+        sup = data["settings"]["support_id"]
+        url = sup if sup.startswith("http") else f"https://t.me/{sup.lstrip('@')}"
+        rows = [[btn("💬 Contact Support", url=url, color="green")]]
+        await send_styled_inline(
+            context,
+            update.effective_chat.id,
+            f"🆘 <b>যেকোনো সমস্যা বা সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন:</b>\n👉 {sup}",
+            rows,
+        )
+
+    elif text == "⚙️ Admin Panel" and user_obj.id == ADMIN_ID:
+        await admin_command(update, context)
+
+# ================= MAIN RUNNER =================
+def main():
+    Thread(target=run_flask, daemon=True).start()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(handle_callbacks))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
-    logger.info("Bot is running...")
-    app.run_polling()
-
+    logger.info("Bot started successfully!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
 
 if __name__ == "__main__":
     main()
