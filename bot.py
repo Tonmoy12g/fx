@@ -6,6 +6,8 @@ from threading import Thread
 from flask import Flask
 from telegram import (
     Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
@@ -77,73 +79,170 @@ def get_user(data, user_id, name="User"):
         }
     return data["users"][uid]
 
-# ================= COLORED INLINE BUTTON HELPER =================
-def colored_btn(text: str, callback_data: str = None, url: str = None, color: str = None) -> InlineKeyboardButton:
-    style_map = {
-        "green": "success",
-        "blue": "primary",
-        "red": "danger",
-    }
-    kwargs = {}
+# ================= COLORED BUTTON HELPERS =================
+STYLE_MAP = {
+    "green": "success",
+    "blue": "primary",
+    "red": "danger",
+}
+
+def btn(text: str, callback_data: str = None, url: str = None, color: str = None) -> dict:
+    item = {"text": text}
     if callback_data:
-        kwargs["callback_data"] = callback_data
+        item["callback_data"] = callback_data
     if url:
-        kwargs["url"] = url
+        item["url"] = url
+    if color and color in STYLE_MAP:
+        item["style"] = STYLE_MAP[color]
+    return item
 
-    if color and color in style_map:
+def to_inline_markup(rows: list) -> InlineKeyboardMarkup:
+    keyboard = []
+    for row in rows:
+        kb_row = []
+        for item in row:
+            kwargs = {}
+            if "callback_data" in item:
+                kwargs["callback_data"] = item["callback_data"]
+            if "url" in item:
+                kwargs["url"] = item["url"]
+            kb_row.append(InlineKeyboardButton(item["text"], **kwargs))
+        keyboard.append(kb_row)
+    return InlineKeyboardMarkup(keyboard)
+
+def to_reply_markup(rows: list) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(item["text"]) for item in row] for row in rows],
+        resize_keyboard=True,
+    )
+
+async def send_reply_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    rows: list,
+):
+    chat_id = update.effective_chat.id
+    reply_markup_payload = {
+        "keyboard": rows,
+        "resize_keyboard": True,
+    }
+    try:
+        await context.bot._post(
+            "sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps(reply_markup_payload),
+            },
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=to_reply_markup(rows),
+        )
+
+async def send_styled_inline(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    rows: list,
+):
+    try:
+        await context.bot._post(
+            "sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": json.dumps({"inline_keyboard": rows}),
+            },
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=to_inline_markup(rows),
+        )
+
+async def edit_styled_inline(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    rows: list = None,
+):
+    if rows is not None:
         try:
-            return InlineKeyboardButton(text, style=style_map[color], **kwargs)
-        except TypeError:
-            pass
-    return InlineKeyboardButton(text, **kwargs)
+            await context.bot._post(
+                "editMessageText",
+                data={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "reply_markup": json.dumps({"inline_keyboard": rows}),
+                },
+            )
+            return
+        except Exception:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=to_inline_markup(rows),
+            )
+            return
 
-# ================= INLINE KEYBOARDS =================
-def main_inline_menu(user_id: int) -> InlineKeyboardMarkup:
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+    )
+
+# ================= KEYBOARD ROW BUILDERS =================
+def main_menu_reply_rows(user_id: int) -> list:
     rows = [
+        [btn("🔗 Refer & Earn", color="green")],
         [
-            colored_btn("🔗 Refer & Earn", callback_data="menu_refer", color="green"),
+            btn("💰 Balance", color="blue"),
+            btn("💸 Withdraw", color="red"),
         ],
-        [
-            colored_btn("💰 Balance", callback_data="menu_balance", color="blue"),
-            colored_btn("💸 Withdraw", callback_data="menu_withdraw", color="red"),
-        ],
-        [
-            colored_btn("📞 Support", callback_data="menu_support", color="green"),
-        ],
+        [btn("📞 Support", color="green")],
     ]
     if user_id == ADMIN_ID:
-        rows.append([
-            colored_btn("⚙️ Admin Panel", callback_data="menu_admin", color="blue"),
-        ])
-    return InlineKeyboardMarkup(rows)
+        rows.append([btn("⚙️ Admin Panel", color="blue")])
+    return rows
 
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
+def admin_panel_rows() -> list:
+    return [
         [
-            colored_btn("📊 Bot Stats", callback_data="adm_stats", color="blue"),
-            colored_btn("📣 Broadcast", callback_data="adm_broadcast", color="green"),
+            btn("📊 Bot Stats", callback_data="adm_stats", color="blue"),
+            btn("📣 Broadcast", callback_data="adm_broadcast", color="green"),
         ],
         [
-            colored_btn("🎁 Set Refer Bonus", callback_data="adm_set_bonus", color="green"),
-            colored_btn("💳 Set Min Withdraw", callback_data="adm_set_minwd", color="blue"),
+            btn("🎁 Set Refer Bonus", callback_data="adm_set_bonus", color="green"),
+            btn("💳 Set Min Withdraw", callback_data="adm_set_minwd", color="blue"),
         ],
         [
-            colored_btn("📢 Set Force Channel", callback_data="adm_set_channel", color="blue"),
-            colored_btn("🆘 Set Support ID", callback_data="adm_set_support", color="green"),
+            btn("📢 Set Force Channel", callback_data="adm_set_channel", color="blue"),
+            btn("🆘 Set Support ID", callback_data="adm_set_support", color="green"),
         ],
         [
-            colored_btn("➕ Add Balance", callback_data="adm_add_bal", color="green"),
-            colored_btn("➖ Cut Balance", callback_data="adm_cut_bal", color="red"),
+            btn("➕ Add Balance", callback_data="adm_add_bal", color="green"),
+            btn("➖ Cut Balance", callback_data="adm_cut_bal", color="red"),
         ],
         [
-            colored_btn("🚫 Ban User", callback_data="adm_ban", color="red"),
-            colored_btn("✅ Unban User", callback_data="adm_unban", color="green"),
-        ],
-        [
-            colored_btn("🔙 Back to Menu", callback_data="menu_home", color="blue"),
+            btn("🚫 Ban User", callback_data="adm_ban", color="red"),
+            btn("✅ Unban User", callback_data="adm_unban", color="green"),
         ],
     ]
-    return InlineKeyboardMarkup(keyboard)
 
 # ================= FORCE JOIN CHECK =================
 async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE, data: dict) -> bool:
@@ -157,23 +256,20 @@ async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE, dat
         logger.warning(f"Force join check error for {channel}: {e}")
         return True
 
-async def send_force_join_message(update: Update, data: dict):
+async def send_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
     channel = data["settings"].get("force_channel", "").strip()
     clean_username = channel.lstrip("@")
     join_url = f"https://t.me/{clean_username}"
-    keyboard = InlineKeyboardMarkup([
-        [colored_btn("📢 Join Our Channel", url=join_url, color="blue")],
-        [colored_btn("✅ Joined / Check", callback_data="check_join", color="green")],
-    ])
+    rows = [
+        [btn("📢 Join Our Channel", url=join_url, color="blue")],
+        [btn("✅ Joined / Check", callback_data="check_join", color="green")],
+    ]
     text = (
         "🚫 <b>Access Denied!</b>\n\n"
         "বটটি ব্যবহার করতে হলে অবশ্যই নিচের চ্যানেলে জয়েন করতে হবে।\n"
         "জয়েন করার পর <b>✅ Joined / Check</b> বাটনে ক্লিক করুন।"
     )
-    if update.message:
-        await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    await send_styled_inline(context, update.effective_chat.id, text, rows)
 
 # ================= REWARD REFERRER HELPER =================
 async def process_referral_reward(user_id: int, data: dict, context: ContextTypes.DEFAULT_TYPE):
@@ -232,24 +328,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     joined = await check_force_join(user_obj.id, context, data)
     if not joined:
-        await send_force_join_message(update, data)
+        await send_force_join_message(update, context, data)
         return
 
     await process_referral_reward(user_obj.id, data, context)
 
-    await update.message.reply_text(
+    await send_reply_menu(
+        update,
+        context,
         build_home_text(user_obj.first_name, data),
-        reply_markup=main_inline_menu(user_obj.id),
-        parse_mode=ParseMode.HTML,
+        main_menu_reply_rows(user_obj.id),
     )
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text(
+    await send_styled_inline(
+        context,
+        update.effective_chat.id,
         "⚙️ <b>ADMIN CONTROL PANEL</b>\n\nনিচের বাটনগুলো থেকে বটের সব সেটিংস কন্ট্রোল করুন:",
-        reply_markup=admin_panel_keyboard(),
-        parse_mode=ParseMode.HTML,
+        admin_panel_rows(),
     )
 
 # ================= CALLBACK QUERIES =================
@@ -258,125 +356,37 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_obj = query.from_user
     user_id = user_obj.id
-    uid = str(user_id)
     cb_data = query.data
     data = load_data()
     user = get_user(data, user_id, user_obj.first_name)
 
+    chat_id = query.message.chat.id
+    message_id = query.message.message_id
+
     if user.get("banned") and user_id != ADMIN_ID:
-        await query.message.reply_text("🚫 <b>আপনাকে এই বট থেকে ব্যান করা হয়েছে।</b>", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="🚫 <b>আপনাকে এই বট থেকে ব্যান করা হয়েছে।</b>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if cb_data == "check_join":
         joined = await check_force_join(user_id, context, data)
         if joined:
             await process_referral_reward(user_id, data, context)
-            await query.message.edit_text(
+            await query.message.delete()
+            await send_reply_menu(
+                update,
+                context,
                 build_home_text(user_obj.first_name, data),
-                reply_markup=main_inline_menu(user_id),
-                parse_mode=ParseMode.HTML,
+                main_menu_reply_rows(user_id),
             )
         else:
             await query.answer("❌ আপনি এখনো চ্যানেলে জয়েন করেননি!", show_alert=True)
         return
 
-    if cb_data.startswith("menu_") and cb_data != "menu_home":
-        if not await check_force_join(user_id, context, data):
-            await send_force_join_message(update, data)
-            return
-
-    if cb_data == "menu_home":
-        await query.message.edit_text(
-            build_home_text(user_obj.first_name, data),
-            reply_markup=main_inline_menu(user_id),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if cb_data == "menu_balance":
-        bal_text = (
-            f"👤 <b>আপনার অ্যাকাউন্ট তথ্য</b>\n\n"
-            f"🆔 ইউজার আইডি: <code>{uid}</code>\n"
-            f"💰 বর্তমান ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
-            f"👥 মোট সফল রেফার: <b>{user['refers']} জন</b>\n"
-            f"🎁 প্রতি রেফার বোনাস: <b>{data['settings']['refer_bonus']} ৳</b>"
-        )
-        kb = InlineKeyboardMarkup([
-            [colored_btn("🔙 Back to Menu", callback_data="menu_home", color="blue")]
-        ])
-        await query.message.edit_text(bal_text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return
-
-    if cb_data == "menu_refer":
-        bot_username = context.bot.username
-        ref_link = f"https://t.me/{bot_username}?start={uid}"
-        bonus = data["settings"]["refer_bonus"]
-        share_url = f"https://t.me/share/url?url={ref_link}&text=🔥 প্রতি রেফারে {bonus} টাকা আয় করুন!"
-        kb = InlineKeyboardMarkup([
-            [colored_btn("📤 বন্ধুদের সাথে শেয়ার করুন", url=share_url, color="green")],
-            [colored_btn("🔙 Back to Menu", callback_data="menu_home", color="blue")],
-        ])
-        ref_text = (
-            f"🔗 <b>আপনার রেফারেল লিংক:</b>\n"
-            f"<code>{ref_link}</code>\n\n"
-            f"🎁 প্রতি সফল রেফারে পাবেন: <b>{bonus} ৳</b>\n"
-            f"👥 আপনার মোট রেফার: <b>{user['refers']} জন</b>\n\n"
-            f"<i>লিংকে টাচ করে কপি করুন অথবা শেয়ার বাটনে ক্লিক করুন।</i>"
-        )
-        await query.message.edit_text(ref_text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return
-
-    if cb_data == "menu_withdraw":
-        min_wd = float(data["settings"]["min_withdraw"])
-        if user["balance"] < min_wd:
-            kb = InlineKeyboardMarkup([
-                [colored_btn("🔙 Back to Menu", callback_data="menu_home", color="blue")]
-            ])
-            await query.message.edit_text(
-                f"❌ <b>পর্যাপ্ত ব্যালেন্স নেই!</b>\n\n"
-                f"💰 আপনার ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
-                f"📉 মিনিমাম উইথড্র: <b>{min_wd} ৳</b>",
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-
-        kb = InlineKeyboardMarkup([
-            [
-                colored_btn("🩷 bKash", callback_data="wd_method_bKash", color="red"),
-                colored_btn("🧡 Nagad", callback_data="wd_method_Nagad", color="green"),
-            ],
-            [colored_btn("🔙 Back to Menu", callback_data="menu_home", color="blue")],
-        ])
-        await query.message.edit_text(
-            "💳 <b>পেমেন্ট মেথড সিলেক্ট করুন:</b>",
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if cb_data == "menu_support":
-        sup = data["settings"]["support_id"]
-        url = sup if sup.startswith("http") else f"https://t.me/{sup.lstrip('@')}"
-        kb = InlineKeyboardMarkup([
-            [colored_btn("💬 Contact Support", url=url, color="green")],
-            [colored_btn("🔙 Back to Menu", callback_data="menu_home", color="blue")],
-        ])
-        await query.message.edit_text(
-            f"🆘 <b>যেকোনো সমস্যা বা সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন:</b>\n👉 {sup}",
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if cb_data == "menu_admin" and user_id == ADMIN_ID:
-        await query.message.edit_text(
-            "⚙️ <b>ADMIN CONTROL PANEL</b>\n\nনিচের বাটনগুলো থেকে বটের সব সেটিংস কন্ট্রোল করুন:",
-            reply_markup=admin_panel_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
+    # Withdraw Method Selection (bKash & Nagad Only)
     if cb_data.startswith("wd_method_"):
         method = cb_data.replace("wd_method_", "")
         if method not in ["bKash", "Nagad"]:
@@ -384,14 +394,17 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["wd_method"] = method
         context.user_data["state"] = "WAIT_WD_NUMBER"
-        await query.message.edit_text(
+        await edit_styled_inline(
+            context,
+            chat_id,
+            message_id,
             f"📲 <b>{method}</b> সিলেক্ট করা হয়েছে।\n\n"
             f"এখন আপনার <b>{method} পার্সোনাল নম্বরটি</b> লিখে পাঠান:\n"
             f"<i>(বাতিল করতে /cancel লিখুন)</i>",
-            parse_mode=ParseMode.HTML,
         )
         return
 
+    # Admin Withdraw Approve / Reject
     if cb_data.startswith("wd_approve_") or cb_data.startswith("wd_reject_"):
         if user_id != ADMIN_ID:
             return
@@ -408,9 +421,11 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "approve":
             wd["status"] = "approved"
             save_data(data)
-            await query.message.edit_text(
+            await edit_styled_inline(
+                context,
+                chat_id,
+                message_id,
                 query.message.text_html + "\n\n✅ <b>STATUS: APPROVED BY ADMIN</b>",
-                parse_mode=ParseMode.HTML,
             )
             try:
                 await context.bot.send_message(
@@ -431,9 +446,11 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if target_uid in data["users"]:
                 data["users"][target_uid]["balance"] += amount
             save_data(data)
-            await query.message.edit_text(
+            await edit_styled_inline(
+                context,
+                chat_id,
+                message_id,
                 query.message.text_html + "\n\n❌ <b>STATUS: REJECTED (REFUNDED)</b>",
-                parse_mode=ParseMode.HTML,
             )
             try:
                 await context.bot.send_message(
@@ -448,6 +465,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
+    # Admin Panel Callbacks
     if cb_data.startswith("adm_"):
         if user_id != ADMIN_ID:
             return
@@ -468,9 +486,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📢 ফোর্স চ্যানেল: <b>{s['force_channel'] or 'Off'}</b>\n"
                 f"🆘 সাপোর্ট আইডি: <b>{s['support_id']}</b>"
             )
-            await query.message.edit_text(
-                stats_text, reply_markup=admin_panel_keyboard(), parse_mode=ParseMode.HTML
-            )
+            await edit_styled_inline(context, chat_id, message_id, stats_text, admin_panel_rows())
             return
 
         prompts = {
@@ -488,8 +504,10 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cb_data in prompts:
             state, msg = prompts[cb_data]
             context.user_data["state"] = state
-            await query.message.reply_text(
-                msg + "\n\n<i>বাতিল করতে /cancel লিখুন</i>", parse_mode=ParseMode.HTML
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=msg + "\n\n<i>বাতিল করতে /cancel লিখুন</i>",
+                parse_mode=ParseMode.HTML,
             )
 
 # ================= TEXT MESSAGE HANDLER =================
@@ -509,15 +527,17 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "/cancel":
         context.user_data.clear()
-        await update.message.reply_text(
+        await send_reply_menu(
+            update,
+            context,
             "✅ বর্তমান কাজ বাতিল করা হয়েছে।",
-            reply_markup=main_inline_menu(user_obj.id),
-            parse_mode=ParseMode.HTML,
+            main_menu_reply_rows(user_obj.id),
         )
         return
 
     state = context.user_data.get("state")
 
+    # Admin Input States
     if user_obj.id == ADMIN_ID and state and state.startswith("WAIT_ADM_"):
         context.user_data.clear()
         try:
@@ -601,9 +621,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await check_force_join(user_obj.id, context, data):
-        await send_force_join_message(update, data)
+        await send_force_join_message(update, context, data)
         return
 
+    # User Withdraw States
     if state == "WAIT_WD_NUMBER":
         context.user_data["wd_number"] = text
         context.user_data["state"] = "WAIT_WD_AMOUNT"
@@ -648,40 +669,95 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         save_data(data)
 
-        await update.message.reply_text(
+        await send_reply_menu(
+            update,
+            context,
             f"✅ <b>আপনার উইথড্র রিকোয়েস্ট সফলভাবে জমা হয়েছে!</b>\n\n"
             f"🆔 রিকোয়েস্ট আইডি: <code>#{wd_id}</code>\n"
             f"💳 মেথড: <b>{method}</b>\n"
             f"📱 নম্বর: <code>{number}</code>\n"
             f"💰 পরিমাণ: <b>{amount} ৳</b>\n\n"
             f"⏳ অ্যাডমিন চেক করে দ্রুত পেমেন্ট করে দেবেন।",
-            reply_markup=main_inline_menu(user_obj.id),
-            parse_mode=ParseMode.HTML,
+            main_menu_reply_rows(user_obj.id),
         )
 
-        admin_kb = InlineKeyboardMarkup([
+        admin_rows = [
             [
-                colored_btn("✅ Approve", callback_data=f"wd_approve_{wd_id}", color="green"),
-                colored_btn("❌ Reject", callback_data=f"wd_reject_{wd_id}", color="red"),
+                btn("✅ Approve", callback_data=f"wd_approve_{wd_id}", color="green"),
+                btn("❌ Reject", callback_data=f"wd_reject_{wd_id}", color="red"),
             ]
-        ])
+        ]
         try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"🔔 <b>NEW WITHDRAW REQUEST (#{wd_id})</b>\n\n"
-                    f"👤 ইউজার: <b>{user_obj.first_name}</b> (<code>{uid}</code>)\n"
-                    f"👥 মোট রেফার: <b>{user['refers']}</b>\n"
-                    f"💳 মেথড: <b>{method}</b>\n"
-                    f"📱 নম্বর: <code>{number}</code>\n"
-                    f"💰 পরিমাণ: <b>{amount} ৳</b>"
-                ),
-                reply_markup=admin_kb,
-                parse_mode=ParseMode.HTML,
+            await send_styled_inline(
+                context,
+                ADMIN_ID,
+                f"🔔 <b>NEW WITHDRAW REQUEST (#{wd_id})</b>\n\n"
+                f"👤 ইউজার: <b>{user_obj.first_name}</b> (<code>{uid}</code>)\n"
+                f"👥 মোট রেফার: <b>{user['refers']}</b>\n"
+                f"💳 মেথড: <b>{method}</b>\n"
+                f"📱 নম্বর: <code>{number}</code>\n"
+                f"💰 পরিমাণ: <b>{amount} ৳</b>",
+                rows=admin_rows,
             )
         except Exception as e:
             logger.error(f"Failed to send admin withdraw alert: {e}")
         return
+
+    # Reply Keyboard Menu Handlers
+    if text == "🔗 Refer & Earn":
+        bot_username = context.bot.username
+        ref_link = f"https://t.me/{bot_username}?start={uid}"
+        bonus = data["settings"]["refer_bonus"]
+        share_url = f"https://t.me/share/url?url={ref_link}&text=🔥 প্রতি রেফারে {bonus} টাকা আয় করুন!"
+        rows = [[btn("📤 বন্ধুদের সাথে শেয়ার করুন", url=share_url, color="green")]]
+        ref_text = (
+            f"🔗 <b>আপনার রেফারেল লিংক:</b>\n"
+            f"<code>{ref_link}</code>\n\n"
+            f"🎁 প্রতি সফল রেফারে পাবেন: <b>{bonus} ৳</b>\n"
+            f"👥 আপনার মোট রেফার: <b>{user['refers']} জন</b>"
+        )
+        await send_styled_inline(context, update.effective_chat.id, ref_text, rows)
+
+    elif text == "💰 Balance":
+        bal_text = (
+            f"👤 <b>আপনার অ্যাকাউন্ট তথ্য</b>\n\n"
+            f"🆔 ইউজার আইডি: <code>{uid}</code>\n"
+            f"💰 বর্তমান ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
+            f"👥 মোট সফল রেফার: <b>{user['refers']} জন</b>\n"
+            f"🎁 প্রতি রেফার বোনাস: <b>{data['settings']['refer_bonus']} ৳</b>"
+        )
+        await update.message.reply_text(bal_text, parse_mode=ParseMode.HTML)
+
+    elif text == "💸 Withdraw":
+        min_wd = float(data["settings"]["min_withdraw"])
+        if user["balance"] < min_wd:
+            await update.message.reply_text(
+                f"❌ <b>পর্যাপ্ত ব্যালেন্স নেই!</b>\n\n"
+                f"💰 আপনার ব্যালেন্স: <b>{user['balance']} ৳</b>\n"
+                f"📉 মিনিমাম উইথড্র: <b>{min_wd} ৳</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        rows = [[
+            btn("🩷 bKash", callback_data="wd_method_bKash", color="red"),
+            btn("🧡 Nagad", callback_data="wd_method_Nagad", color="green"),
+        ]]
+        await send_styled_inline(context, update.effective_chat.id, "💳 <b>পেমেন্ট মেথড সিলেক্ট করুন:</b>", rows)
+
+    elif text == "📞 Support":
+        sup = data["settings"]["support_id"]
+        url = sup if sup.startswith("http") else f"https://t.me/{sup.lstrip('@')}"
+        rows = [[btn("💬 Contact Support", url=url, color="green")]]
+        await send_styled_inline(
+            context,
+            update.effective_chat.id,
+            f"🆘 <b>যেকোনো সমস্যা বা সাহায্যের জন্য সাপোর্টে যোগাযোগ করুন:</b>\n👉 {sup}",
+            rows,
+        )
+
+    elif text == "⚙️ Admin Panel" and user_obj.id == ADMIN_ID:
+        await admin_command(update, context)
 
 # ================= MAIN RUNNER =================
 def main():
