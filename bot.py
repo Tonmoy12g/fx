@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 import logging
 from threading import Thread
 from flask import Flask
@@ -78,12 +79,6 @@ def get_user(data, user_id, name="User"):
 
 # ================= COLORED INLINE BUTTON HELPER =================
 def colored_btn(text: str, callback_data: str = None, url: str = None, color: str = None) -> InlineKeyboardButton:
-    """
-    Telegram Colored Inline Button helper.
-    color: 'green', 'blue', 'red', or None
-    নতুন Bot API / লাইব্রেরি ভার্সনে style/color প্যারামিটার থাকলে পাস করবে,
-    না থাকলে সাধারণ InlineKeyboardButton হিসেবে কাজ করবে।
-    """
     style_map = {
         "green": "success",
         "blue": "primary",
@@ -272,7 +267,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("🚫 <b>আপনাকে এই বট থেকে ব্যান করা হয়েছে।</b>", parse_mode=ParseMode.HTML)
         return
 
-    # Force Join Recheck
     if cb_data == "check_join":
         joined = await check_force_join(user_id, context, data)
         if joined:
@@ -286,13 +280,11 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ আপনি এখনো চ্যানেলে জয়েন করেননি!", show_alert=True)
         return
 
-    # Force join check for menu actions
     if cb_data.startswith("menu_") and cb_data != "menu_home":
         if not await check_force_join(user_id, context, data):
             await send_force_join_message(update, data)
             return
 
-    # Home Menu Navigation
     if cb_data == "menu_home":
         await query.message.edit_text(
             build_home_text(user_obj.first_name, data),
@@ -385,7 +377,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Withdraw Method Selection (bKash & Nagad Only)
     if cb_data.startswith("wd_method_"):
         method = cb_data.replace("wd_method_", "")
         if method not in ["bKash", "Nagad"]:
@@ -401,7 +392,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Admin Withdraw Approve / Reject
     if cb_data.startswith("wd_approve_") or cb_data.startswith("wd_reject_"):
         if user_id != ADMIN_ID:
             return
@@ -458,7 +448,6 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # ================= ADMIN PANEL CALLBACKS =================
     if cb_data.startswith("adm_"):
         if user_id != ADMIN_ID:
             return
@@ -529,7 +518,6 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get("state")
 
-    # ================= ADMIN INPUT STATES =================
     if user_obj.id == ADMIN_ID and state and state.startswith("WAIT_ADM_"):
         context.user_data.clear()
         try:
@@ -616,7 +604,6 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_force_join_message(update, data)
         return
 
-    # ================= USER WITHDRAW STATES =================
     if state == "WAIT_WD_NUMBER":
         context.user_data["wd_number"] = text
         context.user_data["state"] = "WAIT_WD_AMOUNT"
@@ -699,6 +686,10 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MAIN RUNNER =================
 def main():
     Thread(target=run_flask, daemon=True).start()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -707,7 +698,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
     logger.info("Bot started successfully!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=None)
 
 if __name__ == "__main__":
     main()
