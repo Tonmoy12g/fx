@@ -59,7 +59,7 @@ DEFAULT_DATA = {
         # ---- পেআউট লগ (OFF থাকলে শুধু অ্যাডমিনকে নোটিফিকেশন যায়) ----
         "payout_log_active": "OFF",
         "payout_log_chat": "",
-        "force_channel": "",
+        "force_channels": [],  # ফোর্স জয়েন চ্যানেলের লিস্ট (খালি = OFF, কোনো সর্বোচ্চ সীমা নেই)
         "support_id": "@AdminUsername",
     },
     "withdraws": {},
@@ -78,6 +78,19 @@ def load_data():
         data.setdefault("settings", {}).setdefault(key, val)
     data.setdefault("withdraws", {})
     data.setdefault("withdraw_counter", 1000)
+    # force_channels সবসময় আলাদা লিস্ট হিসেবে রাখো (ডিফল্ট লিস্ট শেয়ার করলে সেটা নষ্ট হবে)
+    fc = data["settings"].get("force_channels")
+    if not isinstance(fc, list):
+        fc = [fc] if isinstance(fc, str) and fc.strip() else []
+    data["settings"]["force_channels"] = list(fc)
+    # পুরনো এক-চ্যানেল সেটিং (force_channel) থাকলে লিস্টে নিয়ে নাও (একবারই)
+    legacy = str(data["settings"].get("force_channel", "") or "").strip()
+    if legacy:
+        channels = data["settings"]["force_channels"]
+        if legacy not in channels:
+            channels.append(legacy)
+        data["settings"]["force_channel"] = ""
+        save_data(data)
     return data
 
 def save_data(data):
@@ -393,7 +406,7 @@ def admin_panel_rows() -> list:
             btn("🎁 Set Refer Bonus", callback_data="adm_set_bonus", color="green"),
         ],
         [
-            btn("📢 Set Force Channel", callback_data="adm_set_channel", color="blue"),
+            btn("📢 Force Channels", callback_data="adm_set_channel", color="blue"),
             btn("🆘 Set Support ID", callback_data="adm_set_support", color="green"),
         ],
         [
@@ -406,29 +419,44 @@ def admin_panel_rows() -> list:
         ],
     ]
 
+def get_force_channels(data: dict) -> list:
+    """ফোর্স চ্যানেলের লিস্ট দেয় (পুরনো এক-চ্যানেল সেটিং থেকেও পড়ে)।"""
+    s = data["settings"]
+    channels = s.get("force_channels", [])
+    if isinstance(channels, str):
+        channels = [channels] if channels.strip() else []
+    channels = [str(c).strip() for c in channels if str(c).strip()]
+    legacy = str(s.get("force_channel", "") or "").strip()
+    if legacy and legacy not in channels:
+        channels.append(legacy)
+    return channels
+
+
 # ================= FORCE JOIN CHECK =================
 async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE, data: dict) -> bool:
-    channel = data["settings"].get("force_channel", "").strip()
-    if not channel or user_id == ADMIN_ID:
+    channels = get_force_channels(data)
+    if not channels or user_id == ADMIN_ID:
         return True
-    try:
-        member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except Exception as e:
-        logger.warning(f"Force join check error for {channel}: {e}")
-        return True
+    for channel in channels:
+        try:
+            member = await context.bot.get_chat_member(chat_id=channel, user_id=user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        except Exception as e:
+            logger.warning(f"Force join check error for {channel}: {e}")
+            continue  # এই চ্যানেলের চেকে সমস্যা হলে ধরে নেওয়া হয় জয়েন করেছে (আগের মতোই fail-open)
+    return True
 
 async def send_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    channel = data["settings"].get("force_channel", "").strip()
-    clean_username = channel.lstrip("@")
-    join_url = f"https://t.me/{clean_username}"
-    rows = [
-        [btn("📢 Join Our Channel", url=join_url, color="blue")],
-        [btn("✅ Joined / Check", callback_data="check_join", color="green")],
-    ]
+    channels = get_force_channels(data)
+    rows = []
+    for channel in channels:
+        clean_username = channel.lstrip("@")
+        rows.append([btn(f"📢 Join {channel}", url=f"https://t.me/{clean_username}", color="blue")])
+    rows.append([btn("✅ Joined / Check", callback_data="check_join", color="green")])
     text = (
         "🚫 <b>Access Denied!</b>\n\n"
-        "বটটি ব্যবহার করতে হলে অবশ্যই নিচের চ্যানেলে জয়েন করতে হবে।\n"
+        "বটটি ব্যবহার করতে হলে অবশ্যই নিচের সব চ্যানেলে জয়েন করতে হবে।\n"
         "জয়েন করার পর <b>✅ Joined / Check</b> বাটনে ক্লিক করুন।"
     )
     await send_styled_inline(context, update.effective_chat.id, text, rows)
@@ -540,6 +568,26 @@ async def show_wd_settings_page(context, chat_id, message_id, data):
         [btn(f"✏️ চার্জ সেট করুন ({charge:g} ৳)", callback_data="adm_wd_edit_charge", color="blue")],
         [btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")],
     ]
+    await edit_styled_inline(context, chat_id, message_id, text, rows)
+
+async def show_force_channels_page(context, chat_id, message_id, data):
+    channels = get_force_channels(data)
+    if channels:
+        text = "📢 <b>ফোর্স চ্যানেল ম্যানেজমেন্ট</b>\n\n"
+        rows = []
+        for i, ch in enumerate(channels):
+            text += f"{i+1}. <code>{ch}</code>\n"
+            rows.append([btn(f"🗑️ মুছুন: {ch}", callback_data=f"adm_fc_del_{i}", color="red")])
+    else:
+        text = (
+            "📢 <b>ফোর্স চ্যানেল ম্যানেজমেন্ট</b>\n\n"
+            "❌ কোনো ফোর্স চ্যানেল সেট করা নেই — ফোর্স জয়েন এখন <b>Off</b>।"
+        )
+        rows = []
+    rows.append([btn("➕ চ্যানেল যোগ করুন", callback_data="adm_fc_add", color="green")])
+    if channels:
+        rows.append([btn("🗑️ সব মুছে ফেলুন", callback_data="adm_fc_clear", color="red")])
+    rows.append([btn("⬅️ অ্যাডমিন প্যানেল", callback_data="adm_menu", color="blue")])
     await edit_styled_inline(context, chat_id, message_id, text, rows)
 
 async def show_payout_log_page(context, chat_id, message_id, data):
@@ -703,6 +751,8 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mn_b, mx_b = wd_method_limits(data, "bKash")
             mn_n, mx_n = wd_method_limits(data, "Nagad")
             wd_status = "✅ ON" if withdraw_allowed(data) else "❌ OFF"
+            fc = get_force_channels(data)
+            fc_text = ", ".join(fc) if fc else "Off"
             stats_text = (
                 "📊 <b>BOT LIVE STATISTICS</b>\n\n"
                 f"👥 মোট ইউজার: <b>{total_users}</b>\n"
@@ -713,7 +763,7 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💸 উইথড্র: <b>{wd_status}</b>\n"
                 f"🩷 bKash: <b>{mn_b:g}–{mx_b:g} ৳</b> ({s.get('wd_bkash_active', 'ON')})\n"
                 f"🧡 Nagad: <b>{mn_n:g}–{mx_n:g} ৳</b> ({s.get('wd_nagad_active', 'ON')})\n"
-                f"📢 ফোর্স চ্যানেল: <b>{s['force_channel'] or 'Off'}</b>\n"
+                f"📢 ফোর্স চ্যানেল ({len(fc)}টি): <b>{fc_text}</b>\n"
                 f"🆘 সাপোর্ট আইডি: <b>{s['support_id']}</b>"
             )
             await edit_styled_inline(context, chat_id, message_id, stats_text, admin_panel_rows())
@@ -832,9 +882,45 @@ async def handle_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if cb_data == "adm_set_channel":
+            await show_force_channels_page(context, chat_id, message_id, data)
+            return
+
+        if cb_data == "adm_fc_add":
+            context.user_data["state"] = "WAIT_ADM_CHANNEL"
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📢 ফোর্স জয়েন চ্যানেলের <code>@username</code> দিন (বটকে চ্যানেলে অ্যাডমিন রাখবেন)। সব মুছে ফেলতে <code>off</code> লিখুন:\n\n<i>বাতিল করতে /cancel লিখুন</i>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if cb_data.startswith("adm_fc_del_"):
+            try:
+                idx = int(cb_data.replace("adm_fc_del_", ""))
+                channels = get_force_channels(data)
+                if 0 <= idx < len(channels):
+                    removed = channels.pop(idx)
+                    data["settings"]["force_channels"] = channels
+                    save_data(data)
+                    await query.answer(f"✅ {removed} মুছে ফেলা হয়েছে।")
+                else:
+                    await query.answer("⚠️ এই চ্যানেলটি পাওয়া যায়নি!", show_alert=True)
+            except ValueError:
+                await query.answer("⚠️ ভুল বাটন!", show_alert=True)
+            await show_force_channels_page(context, chat_id, message_id, data)
+            return
+
+        if cb_data == "adm_fc_clear":
+            data["settings"]["force_channels"] = []
+            data["settings"]["force_channel"] = ""
+            save_data(data)
+            await query.answer("✅ সব ফোর্স চ্যানেল মুছে ফেলা হয়েছে।")
+            await show_force_channels_page(context, chat_id, message_id, data)
+            return
+
         prompts = {
             "adm_set_bonus": ("WAIT_ADM_BONUS", "🎁 প্রতি রেফারে কত টাকা বোনাস দিতে চান? (যেমন: <code>2</code> বা <code>5</code>)"),
-            "adm_set_channel": ("WAIT_ADM_CHANNEL", "📢 ফোর্স জয়েন চ্যানেলের <code>@username</code> দিন (বটকে চ্যানেলে অ্যাডমিন রাখবেন)। অফ করতে <code>off</code> লিখুন:"),
             "adm_set_support": ("WAIT_ADM_SUPPORT", "🆘 সাপোর্ট অ্যাডমিনের <code>@username</code> বা লিংক দিন:"),
             "adm_add_bal": ("WAIT_ADM_ADDBAL", "➕ টাকা যোগ করতে <code>USER_ID AMOUNT</code> লিখুন:\n(উদাহরণ: <code>123456789 50</code>)"),
             "adm_cut_bal": ("WAIT_ADM_CUTBAL", "➖ টাকা কাটতে <code>USER_ID AMOUNT</code> লিখুন:\n(উদাহরণ: <code>123456789 20</code>)"),
@@ -921,9 +1007,24 @@ async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ পেআউট লগ চ্যাট আপডেট হয়েছে: <b>{data['settings']['payout_log_chat'] or 'Off'}</b>", parse_mode=ParseMode.HTML)
 
             elif state == "WAIT_ADM_CHANNEL":
-                data["settings"]["force_channel"] = "" if text.lower() == "off" else text
-                save_data(data)
-                await update.message.reply_text(f"✅ ফোর্স চ্যানেল আপডেট হয়েছে: <b>{data['settings']['force_channel'] or 'Off'}</b>", parse_mode=ParseMode.HTML)
+                if text.lower() == "off":
+                    data["settings"]["force_channels"] = []
+                    data["settings"]["force_channel"] = ""
+                    save_data(data)
+                    await update.message.reply_text("✅ সব ফোর্স চ্যানেল মুছে ফেলা হয়েছে — ফোর্স জয়েন এখন <b>Off</b>।", parse_mode=ParseMode.HTML)
+                else:
+                    ch = text.strip()
+                    if not ch.startswith("@"):
+                        ch = "@" + ch
+                    channels = get_force_channels(data)
+                    if ch.lower() in [c.lower() for c in channels]:
+                        await update.message.reply_text(f"❌ <code>{ch}</code> চ্যানেলটি আগেই যোগ করা আছে।", parse_mode=ParseMode.HTML)
+                    else:
+                        channels.append(ch)
+                        data["settings"]["force_channels"] = channels
+                        data["settings"]["force_channel"] = ""
+                        save_data(data)
+                        await update.message.reply_text(f"✅ ফোর্স চ্যানেল যোগ হয়েছে: <code>{ch}</code> (মোট <b>{len(channels)}টি</b>)", parse_mode=ParseMode.HTML)
 
             elif state == "WAIT_ADM_SUPPORT":
                 data["settings"]["support_id"] = text
